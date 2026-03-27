@@ -23,6 +23,11 @@ create table if not exists public.checklist_items (
   section_path text not null default '',
   requirement_id text not null,
   requirement_text text not null,
+  requirement_base_id text not null default '',
+  clause_path text not null default '',
+  requirement_text_leaf text not null default '',
+  notes_text text not null default '',
+  item_kind text not null default 'rule' check (item_kind in ('rule', 'group', 'note')),
   reference_text text not null default '',
   embedding_text text not null,
   created_at timestamptz not null default now(),
@@ -47,6 +52,8 @@ create index if not exists idx_checklist_item_embeddings_vector
   using ivfflat (embedding vector_cosine_ops)
   with (lists = 100);
 
+drop function if exists public.match_checklist_items(vector(1536), text, int);
+
 create or replace function public.match_checklist_items (
   query_embedding vector(1536),
   filter_type_key text,
@@ -56,7 +63,10 @@ returns table (
   item_key text,
   checklist_type_key text,
   requirement_id text,
+  requirement_base_id text,
+  clause_path text,
   requirement_text text,
+  requirement_text_leaf text,
   reference_text text,
   sheet_name text,
   section_path text,
@@ -68,7 +78,10 @@ as $$
     ci.item_key,
     ci.checklist_type_key,
     ci.requirement_id,
+    ci.requirement_base_id,
+    ci.clause_path,
     ci.requirement_text,
+    ci.requirement_text_leaf,
     ci.reference_text,
     ci.sheet_name,
     ci.section_path,

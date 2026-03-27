@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 
 from app.core.checklist_type_keys import resolve_framework_form_value
+from app.core.requirement_order import requirement_id_sort_key
 from app.core.config import get_settings
 from app.db.supabase import get_supabase_client
 from app.schemas.analysis import (
@@ -116,11 +117,17 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
     )
     checklist_rows = (
         supabase.table("checklist_items")
-        .select("item_key,requirement_id,requirement_text")
+        .select("item_key,requirement_id,requirement_text,sheet_name")
         .eq("checklist_type_key", analysis["checklist_type_key"])
         .execute()
         .data
         or []
+    )
+    checklist_rows.sort(
+        key=lambda r: (
+            (r.get("sheet_name") or "").lower(),
+            requirement_id_sort_key(str(r.get("requirement_id") or "")),
+        )
     )
     result_by_item = {row["item_key"]: row for row in result_rows}
 
@@ -142,6 +149,7 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
         items.append(
             AnalysisChecklistItem(
                 id=checklist["requirement_id"],
+                itemKey=str(checklist["item_key"]),
                 requirement=checklist["requirement_text"],
                 status=status,
                 evidence=evidence,

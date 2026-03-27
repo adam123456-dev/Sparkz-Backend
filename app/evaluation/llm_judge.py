@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 _SYSTEM = (
     "Return JSON only. Keys: status (string, exactly FULLY or PARTIAL or NONE) "
     "and why (one short English sentence, max 25 words, no line breaks). "
+    "Evidence lines may start with \"Page N:\"; mention page numbers in why when they help. "
     "FULLY if evidence clearly satisfies the requirement; PARTIAL if only some; "
     "NONE if evidence does not support it or is absent."
 )
@@ -25,7 +26,10 @@ def judge_disclosure(
     req = (requirement_text or "").strip()
     ev = (evidence_text or "").strip()
     user = (
-        f"Requirement:\n{req}\n\nEvidence from document:\n{ev}\n\n"
+        f"Requirement:\n{req}\n\n"
+        "Evidence from document (retrieved chunks; each paragraph may start with \"Page N:\" "
+        "for the PDF page that chunk came from):\n"
+        f"{ev}\n\n"
         'Respond with JSON: {"status":"FULLY|PARTIAL|NONE","why":"..."}'
     )
 

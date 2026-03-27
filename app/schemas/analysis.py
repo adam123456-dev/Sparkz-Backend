@@ -23,6 +23,7 @@ class AnalysisStatusResponse(BaseModel):
 
 class AnalysisChecklistItem(BaseModel):
     id: str
+    itemKey: str
     requirement: str
     status: str
     evidence: str | None

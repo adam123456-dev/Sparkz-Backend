@@ -216,7 +216,7 @@ def _insert_chunk_embeddings(
 
 
 def _merge_evidence_texts(chunks: list[TopChunk], max_chars: int) -> tuple[str, float]:
-    """Join top chunk texts up to a character budget; return best cosine score."""
+    """Join top chunk texts with optional page labels; return best cosine score."""
     if not chunks or not chunks[0].chunk_id:
         return "", 0.0
     best_sim = float(chunks[0].similarity)
@@ -231,14 +231,17 @@ def _merge_evidence_texts(chunks: list[TopChunk], max_chars: int) -> tuple[str, 
         text = (ch.text_redacted or "").strip()
         if not text:
             continue
+        page = int(ch.page_number or 0)
+        label = f"Page {page}: " if page > 0 else ""
+        block = f"{label}{text}"
         gap = 2 if pieces else 0
-        if used + gap + len(text) > max_chars:
-            room = max_chars - used - gap
+        if used + gap + len(block) > max_chars:
+            room = max_chars - used - gap - len(label)
             if room > 80:
-                pieces.append(text[:room])
+                pieces.append(f"{label}{text[:room]}")
             break
-        pieces.append(text)
-        used += gap + len(text)
+        pieces.append(block)
+        used += gap + len(block)
     return "\n\n".join(pieces), best_sim
 
 
@@ -289,6 +292,9 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
                 explanation = None
         else:
             status = status_from_similarity(best_sim)
+
+        if status == "missing":
+            explanation = "No evidence found."
 
         evidence = merged[:900] if merged.strip() and status != "missing" else None
         results_payload.append(

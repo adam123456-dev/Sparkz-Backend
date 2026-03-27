@@ -16,6 +16,34 @@ XML_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"a": XML_MAIN_NS, "r": XML_REL_NS, "p": XML_PKG_REL_NS}
 
 REQUIREMENT_ID_RE = re.compile(r"^(?:[A-Z]{1,5}\s*)?\d+(?:\.\d+)+$|^A\d+\.\d+$")
+CLAUSE_MARKER_RE = re.compile(r"^\(([A-Za-z0-9]+)\)\s*(.*)$")
+# Single letters like (c) are clause markers, not Roman "100". Use an explicit list.
+_ROMAN_SUBCLAUSE_TOKENS = frozenset(
+    {
+        "i",
+        "ii",
+        "iii",
+        "iv",
+        "v",
+        "vi",
+        "vii",
+        "viii",
+        "ix",
+        "x",
+        "xi",
+        "xii",
+        "xiii",
+        "xiv",
+        "xv",
+        "xvi",
+        "xvii",
+        "xviii",
+        "xix",
+        "xx",
+        "xxi",
+        "xxii",
+    }
+)
 TOP_META_PREFIXES = ("client", "year", "period", "file number", "prepared by", "reviewed by", "date")
 NON_REQUIREMENT_PREFIXES = (
     "appendix",
@@ -25,6 +53,7 @@ NON_REQUIREMENT_PREFIXES = (
     "assurance review report",
     "political donations",
 )
+NOTE_PREFIXES = ("note", "notes")
 
 
 @dataclass(slots=True)
@@ -135,54 +164,217 @@ class ChecklistWorkbookParser:
     ) -> list[ChecklistItem]:
         items: list[ChecklistItem] = []
         section_path = ""
-        current_item: ChecklistItem | None = None
+
+        base_id = ""
+        base_text = ""
+        base_ref = ""
+        alpha_token = ""
+        alpha_text = ""
+        had_roman_under_alpha = False
+        note_lines: list[str] = []
+        saw_atomic_for_base = False
+
+        def emit_alpha_standalone() -> None:
+            """Emit base_id + (alpha) when there are no (i)/(ii) children under that alpha."""
+            nonlocal saw_atomic_for_base, alpha_token, alpha_text, had_roman_under_alpha
+            if not base_id or not alpha_token:
+                return
+            if had_roman_under_alpha:
+                return
+            clause_path = f"({alpha_token})"
+            full_id = f"{base_id}{clause_path}"
+            composed = self._compose_requirement_text(base_text, alpha_text, "")
+            if not composed.strip():
+                return
+            items.append(
+                ChecklistItem(
+                    source_workbook=workbook_name,
+                    framework=framework,
+                    sheet_name=sheet_name,
+                    section_path=section_path,
+                    requirement_id=full_id,
+                    requirement_text=composed,
+                    requirement_text_leaf=alpha_text.strip(),
+                    requirement_base_id=base_id,
+                    clause_path=clause_path,
+                    notes_text=" ".join(note_lines).strip(),
+                    reference_text=base_ref,
+                    item_kind="rule",
+                )
+            )
+            saw_atomic_for_base = True
+            alpha_token = ""
+            alpha_text = ""
+            had_roman_under_alpha = False
+
+        def flush_base_if_needed() -> None:
+            nonlocal saw_atomic_for_base
+            if not base_id:
+                return
+            emit_alpha_standalone()
+            if saw_atomic_for_base:
+                return
+            if not base_text:
+                return
+            items.append(
+                ChecklistItem(
+                    source_workbook=workbook_name,
+                    framework=framework,
+                    sheet_name=sheet_name,
+                    section_path=section_path,
+                    requirement_id=base_id,
+                    requirement_text=base_text,
+                    requirement_text_leaf=base_text,
+                    requirement_base_id=base_id,
+                    clause_path="",
+                    notes_text=" ".join(note_lines).strip(),
+                    reference_text=base_ref,
+                    item_kind="rule",
+                )
+            )
 
         for row in rows:
-            first = self._normalize_requirement_id_candidate(row.first)
+            first = self._pad_id_decimal_segments(self._normalize_requirement_id_candidate(row.first))
             second = row.second
             third = row.third
+            row_text = self._row_text(first, second)
 
             if self._is_top_metadata_row(first):
                 continue
 
             if self._looks_like_section_header(first, second):
+                flush_base_if_needed()
+                base_id = ""
+                base_text = ""
+                base_ref = ""
+                alpha_token = ""
+                alpha_text = ""
+                had_roman_under_alpha = False
+                note_lines = []
+                saw_atomic_for_base = False
                 section_path = self._build_section_path(section_path, first, second)
                 continue
 
             if self._is_requirement_id(first):
-                if current_item:
-                    items.append(current_item)
-                current_item = ChecklistItem(
-                    source_workbook=workbook_name,
-                    framework=framework,
-                    sheet_name=sheet_name,
-                    section_path=section_path,
-                    requirement_id=first,
-                    requirement_text=second,
-                    reference_text=third,
-                )
+                flush_base_if_needed()
+                base_id = first
+                base_text = second.strip()
+                base_ref = third.strip()
+                alpha_token = ""
+                alpha_text = ""
+                had_roman_under_alpha = False
+                note_lines = []
+                saw_atomic_for_base = False
                 continue
 
-            if current_item and self._is_continuation_row(row):
-                extension_text = second or first
-                if extension_text:
-                    current_item.requirement_text = self._append_sentence(
-                        current_item.requirement_text, extension_text
+            if not base_id:
+                if first and not second and not third and not self._is_non_requirement_text(first):
+                    section_path = self._build_section_path(section_path, first, "")
+                continue
+
+            if self._is_note_row(row_text):
+                note_lines.append(row_text)
+                continue
+
+            token, token_text = self._extract_clause_token(row_text)
+            if token:
+                if self._is_alpha_token(token):
+                    new_alpha = token.lower()
+                    if alpha_token and new_alpha != alpha_token:
+                        emit_alpha_standalone()
+                    alpha_token = new_alpha
+                    alpha_text = token_text
+                    had_roman_under_alpha = False
+                    continue
+
+                if self._is_roman_token(token):
+                    if not alpha_token:
+                        if row_text:
+                            base_text = self._append_sentence(base_text, row_text)
+                        if third and third not in base_ref:
+                            base_ref = self._append_sentence(base_ref, third)
+                        continue
+                    clause_path = f"({alpha_token})({token.lower()})"
+                    full_id = f"{base_id}{clause_path}"
+                    composed_full = self._compose_requirement_text(base_text, alpha_text, token_text)
+                    item = ChecklistItem(
+                        source_workbook=workbook_name,
+                        framework=framework,
+                        sheet_name=sheet_name,
+                        section_path=section_path,
+                        requirement_id=full_id,
+                        requirement_text=composed_full,
+                        requirement_text_leaf=token_text,
+                        requirement_base_id=base_id,
+                        clause_path=clause_path,
+                        notes_text=" ".join(note_lines).strip(),
+                        reference_text=self._append_sentence(base_ref, third),
+                        item_kind="rule",
                     )
-                if third and third not in current_item.reference_text:
-                    current_item.reference_text = self._append_sentence(current_item.reference_text, third)
+                    items.append(item)
+                    saw_atomic_for_base = True
+                    had_roman_under_alpha = True
+                    continue
+
+            if alpha_token and not had_roman_under_alpha and row_text:
+                alpha_text = self._append_sentence(alpha_text, row_text)
+                if third and third not in base_ref:
+                    base_ref = self._append_sentence(base_ref, third)
                 continue
 
-            if first and not second and not third and not self._is_non_requirement_text(first):
-                section_path = self._build_section_path(section_path, first, "")
+            if saw_atomic_for_base and items and items[-1].requirement_base_id == base_id:
+                extension_text = row_text
+                if extension_text:
+                    items[-1].requirement_text_leaf = self._append_sentence(items[-1].requirement_text_leaf, extension_text)
+                    items[-1].requirement_text = self._append_sentence(items[-1].requirement_text, extension_text)
+                if third and third not in items[-1].reference_text:
+                    items[-1].reference_text = self._append_sentence(items[-1].reference_text, third)
+                continue
 
-        if current_item:
-            items.append(current_item)
+            if row_text:
+                base_text = self._append_sentence(base_text, row_text)
+            if third and third not in base_ref:
+                base_ref = self._append_sentence(base_ref, third)
 
+        flush_base_if_needed()
         return [item for item in items if item.requirement_text]
 
     def _is_requirement_id(self, value: str) -> bool:
         return bool(REQUIREMENT_ID_RE.match(value.strip()))
+
+    def _row_text(self, first: str, second: str) -> str:
+        if first and second:
+            if CLAUSE_MARKER_RE.match(first):
+                return self._normalize_text(f"{first} {second}")
+            return self._normalize_text(second)
+        return self._normalize_text(first or second)
+
+    def _is_note_row(self, text: str) -> bool:
+        lower = text.lower().strip()
+        return any(lower.startswith(prefix) for prefix in NOTE_PREFIXES)
+
+    def _extract_clause_token(self, text: str) -> tuple[str, str]:
+        m = CLAUSE_MARKER_RE.match(text.strip())
+        if not m:
+            return "", ""
+        token = m.group(1).strip()
+        body = self._normalize_text(m.group(2))
+        return token, body
+
+    def _is_alpha_token(self, token: str) -> bool:
+        t = token.strip().lower()
+        return len(t) == 1 and "a" <= t <= "z" and not self._is_roman_token(t)
+
+    def _is_roman_token(self, token: str) -> bool:
+        t = token.strip().lower()
+        return t in _ROMAN_SUBCLAUSE_TOKENS
+
+    def _compose_requirement_text(self, base_text: str, alpha_text: str, leaf_text: str) -> str:
+        full = base_text.strip()
+        if alpha_text:
+            full = self._append_sentence(full, alpha_text)
+        full = self._append_sentence(full, leaf_text)
+        return full.strip()
 
     def _is_top_metadata_row(self, first_cell: str) -> bool:
         lower = first_cell.lower()
@@ -246,6 +438,23 @@ class ChecklistWorkbookParser:
         except ValueError:
             return value
         return normalized if "." in normalized else value
+
+    def _pad_id_decimal_segments(self, value: str) -> str:
+        """
+        Excel stores 6.10 as float 6.1 in XML. Format with two decimal places so
+        6.1 -> 6.10 (not 6.01 from naive zero-padding of the last segment).
+        """
+        text = value.strip()
+        if not text or not re.match(r"^\d+(?:\.\d+)+$", text):
+            return value
+        if re.match(r"^\d+\.\d{10,}$", text):
+            return value
+        try:
+            if re.match(r"^\d+\.\d$", text):
+                return f"{float(text):.2f}"
+        except ValueError:
+            return value
+        return value
 
     def _normalize_text(self, value: str) -> str:
         text = value.replace("\r", " ").replace("\n", " ").strip()

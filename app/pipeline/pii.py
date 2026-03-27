@@ -1,3 +1,12 @@
+"""
+Regex-based PII redaction on extracted PDF text before chunking and embedding.
+
+Why: chunk text is embedded (third-party API) and may be sent to an LLM judge.
+Replacing emails, phones, national IDs, and labelled names with placeholders
+reduces accidental disclosure in prompts, logs, and vector stores—not optional
+if those services are outside your trust boundary.
+"""
+
 from __future__ import annotations
 
 import re
