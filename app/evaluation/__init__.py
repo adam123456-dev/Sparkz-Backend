@@ -1,5 +1,6 @@
 """
-Disclosure evaluation: vector top-k retrieval (``retrieval``), optional LLM verdict
-(``llm_judge`` + ``verdict``), similarity fallback (``fallback``), checklist text
-(``requirements``). Orchestrated from ``app.services.analysis_runner``.
+Disclosure evaluation: lexical gate (``lexical``), hybrid top-k (``retrieval``),
+evidence JSON (``evidence_payload``), LLM final judge (``llm_judge`` / ``verdict``),
+and checklist text lookup (``requirements``). Orchestrated from
+``app.services.analysis_runner``.
 """

@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.request import Request, urlopen
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,10 +16,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.checklists import ChecklistItem, parse_workbook
+from app.checklists.llm_keywords import generate_rule_keywords_with_openai
+from app.checklists.retrieval_embedding import retrieval_embedding_source_text
 from app.core.checklist_type_keys import display_name_for_key, type_key_from_workbook_path
 
 _SUPABASE_CLIENT = None
 _SETTINGS = None
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="OpenAI embedding batch size (default: 50).",
     )
+    parser.add_argument(
+        "--refresh-embeddings",
+        action="store_true",
+        help="Re-embed all checklist rows for each type (obligation-only vectors). "
+        "Use after upgrading embedding strategy; requires OPENAI_API_KEY.",
+    )
     return parser.parse_args()
 
 
@@ -108,7 +118,7 @@ def discover_workbooks(workbooks: list[str] | None, scan_root: Path) -> list[Pat
     return sorted(deduped.values())
 
 
-def chunked(rows: list[dict[str, str]], size: int) -> Iterable[list[dict[str, str]]]:
+def chunked(rows: list[dict[str, Any]], size: int) -> Iterable[list[dict[str, Any]]]:
     for idx in range(0, len(rows), size):
         yield rows[idx : idx + size]
 
@@ -139,7 +149,7 @@ def delete_items_for_type(type_key: str) -> int:
     return len(response.data or [])
 
 
-def upsert_items(rows: list[dict[str, str]], batch_size: int) -> int:
+def upsert_items(rows: list[dict[str, Any]], batch_size: int) -> int:
     supabase = get_supabase_client_lazy()
     deduped_rows = dedupe_rows_by_item_key(rows)
     total = 0
@@ -149,26 +159,59 @@ def upsert_items(rows: list[dict[str, str]], batch_size: int) -> int:
     return total
 
 
-def rows_for_workbook(path: Path) -> tuple[str, str, list[dict[str, str]]]:
+def rows_for_workbook(path: Path) -> tuple[str, str, list[dict[str, Any]]]:
     items = parse_workbook(path)
     if not items:
         return "", "", []
 
     type_key = type_key_from_workbook_path(path)
     display_name = display_name_for_key(type_key)
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
 
-    for item in items:
+    settings = get_settings_lazy()
+    total_items = len(items)
+    for idx, item in enumerate(items, start=1):
         row = asdict(item)
         row["item_key"] = item_key_for(type_key, item)
         row["checklist_type_key"] = type_key
         row["embedding_text"] = item.embedding_text
+        keywords, section_hints = _build_search_keywords_for_item(item, settings)
+        row["search_keywords"] = keywords
+        row["section_hints"] = section_hints
         rows.append(row)
+        if idx % 20 == 0 or idx == total_items:
+            print(f"  - keyword generation progress: {idx}/{total_items}", flush=True)
 
     return type_key, display_name, rows
 
 
-def dedupe_rows_by_item_key(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+def _build_search_keywords_for_item(item: ChecklistItem, settings: Any) -> tuple[list[str], list[str]]:
+    """
+    OpenAI-generated keyword tiers only.
+    Stored ``search_keywords`` keeps strict terms first, then likely terms.
+    """
+    print("*****************")
+    print("item", item)
+    print("*****************")
+    section_hints: list[str] = []
+    key = (settings.openai_api_key or "").strip()
+    if not key:
+        return [], section_hints
+    try:
+        keywords = generate_rule_keywords_with_openai(
+            api_key=key,
+            model=settings.openai_chat_model,
+            requirement_text=item.requirement_text,
+            requirement_text_leaf=item.requirement_text_leaf,
+            reference_text=item.reference_text,
+        )
+        return keywords, section_hints
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OpenAI keyword generation failed for %s: %s", item.requirement_id, exc)
+    return [], section_hints
+
+
+def dedupe_rows_by_item_key(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: dict[str, dict[str, str]] = {}
     for row in rows:
         # Last write wins for deterministic behavior if duplicates occur.
@@ -203,7 +246,7 @@ def fetch_items_for_embedding(type_key: str, only_missing: bool = True) -> list[
     while True:
         query = (
             supabase.table("checklist_items")
-            .select("item_key,checklist_type_key,embedding_text")
+            .select("item_key,checklist_type_key,requirement_text,requirement_text_leaf")
             .eq("checklist_type_key", type_key)
             .range(offset, offset + page_size - 1)
         )
@@ -285,8 +328,14 @@ def upsert_embeddings(type_key: str, batch_rows: list[dict[str, str]], embedding
     return len(payload)
 
 
-def generate_embeddings_for_type(type_key: str, embedding_batch_size: int, dry_run: bool) -> int:
-    candidate_rows = fetch_items_for_embedding(type_key, only_missing=True)
+def generate_embeddings_for_type(
+    type_key: str,
+    embedding_batch_size: int,
+    dry_run: bool,
+    *,
+    refresh_all: bool,
+) -> int:
+    candidate_rows = fetch_items_for_embedding(type_key, only_missing=not refresh_all)
     if not candidate_rows:
         print(f"  - embeddings up to date for type '{type_key}'")
         return 0
@@ -297,7 +346,13 @@ def generate_embeddings_for_type(type_key: str, embedding_batch_size: int, dry_r
 
     total = 0
     for batch in chunked(candidate_rows, embedding_batch_size):
-        texts = [row["embedding_text"] for row in batch]
+        texts = [
+            retrieval_embedding_source_text(
+                requirement_text=str(row.get("requirement_text") or ""),
+                requirement_text_leaf=str(row.get("requirement_text_leaf") or ""),
+            )
+            for row in batch
+        ]
         vectors = build_openai_embeddings(texts)
         total += upsert_embeddings(type_key, batch, vectors)
     return total
@@ -341,7 +396,7 @@ def main() -> None:
         print(f"  - upserted {inserted} rows for type '{type_key}'")
 
     print(f"Done. Total parsed rows: {all_rows}")
-    if args.skip_embeddings:
+    if args.skip_embeddings: 
         print("Embedding step skipped (--skip-embeddings).")
         return
 
@@ -352,7 +407,12 @@ def main() -> None:
 
     total_embeddings = 0
     for type_key in unique_type_keys:
-        embedded = generate_embeddings_for_type(type_key, args.embedding_batch_size, args.dry_run)
+        embedded = generate_embeddings_for_type(
+            type_key,
+            args.embedding_batch_size,
+            args.dry_run,
+            refresh_all=args.refresh_embeddings,
+        )
         if embedded:
             print(f"  - upserted {embedded} embeddings for type '{type_key}'")
         total_embeddings += embedded

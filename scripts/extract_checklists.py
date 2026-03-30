@@ -62,7 +62,12 @@ def main() -> None:
         raise SystemExit("At least one output option is required: --json, --csv, or --txt")
 
     items = parse_workbook(args.workbook)
-    rows = [asdict(item) | {"embedding_text": item.embedding_text} for item in items]
+    rows = []
+    for item in items:
+        row = asdict(item) | {"embedding_text": item.embedding_text}
+        row["search_keywords"] = []
+        row["section_hints"] = []
+        rows.append(row)
 
     if args.json_path:
         write_json(args.json_path, rows)

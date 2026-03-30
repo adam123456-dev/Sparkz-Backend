@@ -12,10 +12,13 @@ class SettingsTests(unittest.TestCase):
             self.skipTest("pydantic dependencies are not installed yet")
 
     def test_cors_parses_comma_separated_values(self) -> None:
-        settings = Settings(
-            APP_CORS_ORIGINS="http://localhost:5173,https://sparkz.app",
-            SUPABASE_URL="https://example.supabase.co",
-            SUPABASE_SERVICE_ROLE_KEY="service-role-key",
+        # ``model_validate`` avoids local .env overriding explicit test values.
+        settings = Settings.model_validate(
+            {
+                "app_cors_origins": "http://localhost:5173,https://sparkz.app",
+                "supabase_url": "https://example.supabase.co",
+                "supabase_service_role_key": "service-role-key",
+            }
         )
         self.assertEqual(
             settings.cors_origins,
@@ -23,7 +26,9 @@ class SettingsTests(unittest.TestCase):
         )
 
     def test_validate_external_services_raises_when_missing(self) -> None:
-        settings = Settings()
+        settings = Settings.model_validate(
+            {"supabase_url": "", "supabase_service_role_key": ""},
+        )
         with self.assertRaises(RuntimeError):
             settings.validate_external_services()
 

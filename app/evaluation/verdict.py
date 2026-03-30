@@ -1,4 +1,4 @@
-"""Parse the judge model JSON body: {\"status\": \"FULLY|PARTIAL|NONE\", \"why\": \"...\"}."""
+"""Parse the judge model JSON body: {\"status\": \"FULLY|PARTIAL|NONE\"}."""
 
 from __future__ import annotations
 
@@ -25,10 +25,4 @@ def parse_judge_response(raw: str, *, explanation_max_chars: int = 320) -> tuple
     status = _STATUS_MAP.get(key)
     if not status:
         return None, None
-    why_raw = data.get("why")
-    explanation: str | None
-    if why_raw is None or not str(why_raw).strip():
-        explanation = None
-    else:
-        explanation = str(why_raw).strip()[:explanation_max_chars]
-    return status, explanation
+    return status, None

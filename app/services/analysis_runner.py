@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
 from app.db.supabase import get_supabase_client
-from app.evaluation.fallback import status_from_similarity
+from app.db.supabase_retry import execute_with_retry
 from app.evaluation.llm_judge import judge_disclosure
 from app.evaluation.requirements import requirement_text_by_item_key
+from app.evaluation.evidence_payload import build_evidence_blocks
 from app.evaluation.retrieval import TopChunk, match_checklist_items_top_k
 from app.evaluation.verdict import parse_judge_response
 from app.pipeline.chunking import build_chunks_from_redacted_pages, chunk_texts
@@ -58,6 +58,14 @@ def run_analysis_job(analysis_id: str, pdf_path: str, checklist_type_key: str) -
             redacted_pages.append(redact_pii(page_text or ""))
 
         chunks = build_chunks_from_redacted_pages(redacted_pages)
+        if not chunks:
+            # Without chunks there is nothing to embed or match; evaluation would mark
+            # every checklist row as "missing" and look like a retrieval bug.
+            raise RuntimeError(
+                "No extractable text from this PDF (zero chunks after extraction). "
+                "Common causes: image-only pages with no text layer, or OCR not available. "
+                "Enable OCR (ENABLE_OCR / pdf2image + Tesseract + Poppler) or use a PDF with selectable text."
+            )
         _insert_chunks(analysis_id, chunks)
         _set_step_state(steps, "redaction", "completed")
         _set_step_state(steps, "embedding", "in_progress")
@@ -163,6 +171,7 @@ def _insert_chunks(analysis_id: str, chunks: list[RedactedChunk]) -> None:
             "page_number": chunk.page_number,
             "text_redacted": chunk.text_redacted,
             "text_hash": chunk.text_hash,
+            "heading_guess": chunk.heading_guess or "",
         }
         for chunk in chunks
     ]
@@ -247,31 +256,46 @@ def _merge_evidence_texts(chunks: list[TopChunk], max_chars: int) -> tuple[str, 
 
 def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
     """
-    Retrieve top-k chunks per checklist item (embeddings + NumPy), merge text for
-    context, then set status via a short LLM verdict when configured, else cosine
-    fallback (no chat tokens).
+    Lexical keyword gate → cosine top-k on candidate chunks → OpenAI final verdict.
+
+    **Evidence is always extractive** (``build_evidence_blocks`` from retrieved chunks).
+    The chat model is **never** the source of evidence; it only returns status/explanation
+    from requirement text + retrieved evidence text.
     """
     settings = get_settings()
-    item_keys, tops_per_item = match_checklist_items_top_k(
+    item_keys, tops_per_item, lexical_miss = match_checklist_items_top_k(
         analysis_id,
         checklist_type_key,
         top_k=settings.evaluation_top_k,
+        keyword_prefilter=settings.evaluation_keyword_prefilter,
     )
     if not item_keys:
         logger.warning("No checklist embeddings for type_key=%s", checklist_type_key)
         return
 
     req_by_key = requirement_text_by_item_key(checklist_type_key, item_keys)
-    use_llm = bool(settings.evaluation_use_llm and settings.openai_api_key.strip())
+    kw_by_key = _search_keywords_by_item_key(checklist_type_key, item_keys)
+    if not settings.openai_api_key.strip():
+        raise RuntimeError("OPENAI_API_KEY is required for final rule judgment.")
 
     results_payload = []
-    for item_key, tops in zip(item_keys, tops_per_item):
+    for item_key, tops, kw_miss in zip(item_keys, tops_per_item, lexical_miss):
         merged, best_sim = _merge_evidence_texts(tops, settings.evaluation_evidence_max_chars)
+        evidence_json = build_evidence_blocks(tops)
         requirement = req_by_key.get(item_key, "")[: settings.evaluation_requirement_max_chars]
         evidence_for_model = merged if merged.strip() else "(No matching document text.)"
+        keywords = kw_by_key.get(item_key, [])
+        keyword_score = _keyword_match_ratio(keywords, merged)
+        semantic_score = max(0.0, min(1.0, float(best_sim)))
+        combined_score = 0.5 * keyword_score + 0.5 * semantic_score
 
-        explanation: str | None = None
-        if use_llm:
+        if combined_score >= 0.65:
+            status = "fully_met"
+            explanation = None
+        elif combined_score < 0.30:
+            status = "missing"
+            explanation = None
+        else:
             try:
                 raw = judge_disclosure(
                     api_key=settings.openai_api_key,
@@ -279,30 +303,26 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
                     requirement_text=requirement,
                     evidence_text=evidence_for_model,
                 )
-                parsed_status, explanation = parse_judge_response(
+                parsed_status, _ = parse_judge_response(
                     raw,
                     explanation_max_chars=settings.evaluation_explanation_max_chars,
                 )
-                status = parsed_status if parsed_status is not None else status_from_similarity(best_sim)
-                if parsed_status is None:
-                    explanation = None
-            except Exception:  # noqa: BLE001
-                logger.exception("LLM judge failed for item_key=%s; using similarity fallback", item_key)
-                status = status_from_similarity(best_sim)
+                status = parsed_status or "missing"
                 explanation = None
-        else:
-            status = status_from_similarity(best_sim)
+            except Exception:  # noqa: BLE001
+                logger.exception("LLM judge failed for item_key=%s; defaulting to missing", item_key)
+                status = "missing"
+                explanation = None
 
-        if status == "missing":
-            explanation = "No evidence found."
-
-        evidence = merged[:900] if merged.strip() and status != "missing" else None
+        evidence_snippet = merged[:900] if merged.strip() and status != "missing" else None
+        evidence_value = evidence_json if status != "missing" and evidence_json else None
         results_payload.append(
             {
                 "analysis_id": analysis_id,
                 "item_key": item_key,
                 "status": status,
-                "evidence_snippet": evidence,
+                "evidence_snippet": evidence_snippet,
+                "evidence": evidence_value,
                 "explanation": explanation,
                 "similarity": best_sim,
             }
@@ -313,7 +333,7 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
             table_name="analysis_results",
             rows=results_payload,
             on_conflict="analysis_id,item_key",
-            batch_size=200,
+            batch_size=75,
         )
 
 
@@ -331,25 +351,49 @@ def _upsert_in_batches(
     supabase = get_supabase_client()
     for start in range(0, len(rows), batch_size):
         batch = rows[start : start + batch_size]
-        attempt = 0
-        while True:
-            try:
-                supabase.table(table_name).upsert(batch, on_conflict=on_conflict).execute()
-                break
-            except Exception as exc:  # noqa: BLE001
-                attempt += 1
-                if attempt > max_retries:
-                    raise
-                # Exponential backoff for transient HTTP/2 resets/timeouts.
-                sleep_s = min(8.0, 0.5 * (2 ** (attempt - 1)))
-                logger.warning(
-                    "Upsert retry %s/%s for table=%s batch=%s..%s due to %s",
-                    attempt,
-                    max_retries,
-                    table_name,
-                    start,
-                    start + len(batch) - 1,
-                    type(exc).__name__,
-                )
-                time.sleep(sleep_s)
+        execute_with_retry(
+            lambda b=batch: supabase.table(table_name).upsert(b, on_conflict=on_conflict).execute(),
+            max_retries=max_retries,
+            label=f"upsert {table_name} rows {start}-{start + len(batch) - 1}",
+        )
+
+
+def _search_keywords_by_item_key(checklist_type_key: str, item_keys: list[str]) -> dict[str, list[str]]:
+    if not item_keys:
+        return {}
+    supabase = get_supabase_client()
+    out: dict[str, list[str]] = {}
+    batch_size = 200
+    for start in range(0, len(item_keys), batch_size):
+        batch = item_keys[start : start + batch_size]
+        rows = (
+            supabase.table("checklist_items")
+            .select("item_key,search_keywords")
+            .eq("checklist_type_key", checklist_type_key)
+            .in_("item_key", batch)
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            raw = row.get("search_keywords")
+            if isinstance(raw, list):
+                out[str(row["item_key"])] = [str(x).strip().lower() for x in raw if str(x).strip()]
+            else:
+                out[str(row["item_key"])] = []
+    return out
+
+
+def _keyword_match_ratio(keywords: list[str], evidence_text: str) -> float:
+    if not keywords:
+        return 0.0
+    hay = (evidence_text or "").lower()
+    if not hay.strip():
+        return 0.0
+    matched = 0
+    for kw in keywords:
+        token = (kw or "").strip().lower()
+        if token and token in hay:
+            matched += 1
+    return matched / max(1, len(keywords))
 

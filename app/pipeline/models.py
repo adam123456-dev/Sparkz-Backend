@@ -7,4 +7,5 @@ class RedactedChunk:
     page_number: int
     text_redacted: str
     text_hash: str
+    heading_guess: str = ""
 

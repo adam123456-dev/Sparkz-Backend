@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from app.checklists.retrieval_embedding import retrieval_embedding_source_text
+
 
 @dataclass(slots=True)
 class ChecklistItem:
@@ -33,4 +35,12 @@ class ChecklistItem:
             f"Reference: {self.reference_text}" if self.reference_text else "",
         ]
         return "\n".join(part for part in parts if part).strip()
+
+    @property
+    def retrieval_embedding_text(self) -> str:
+        """Plain obligation string for OpenAI embedding when matching document chunks."""
+        return retrieval_embedding_source_text(
+            requirement_text=self.requirement_text,
+            requirement_text_leaf=self.requirement_text_leaf,
+        )
 

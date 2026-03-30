@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from pydantic import ValidationError
 
 from app.core.checklist_type_keys import resolve_framework_form_value
 from app.core.requirement_order import requirement_id_sort_key
@@ -14,11 +16,28 @@ from app.schemas.analysis import (
     AnalysisResultResponse,
     AnalysisStatusResponse,
     AnalysisStep,
+    EvidenceBlock,
     StartAnalysisResponse,
 )
 from app.services.analysis_runner import run_analysis_job
 
 router = APIRouter(prefix="/analyses", tags=["analyses"])
+
+
+def _evidence_blocks_from_row(raw: Any) -> list[EvidenceBlock] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return None
+    out: list[EvidenceBlock] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            out.append(EvidenceBlock.model_validate(entry))
+        except ValidationError:
+            continue
+    return out or None
 
 
 @router.post("", response_model=StartAnalysisResponse)
@@ -109,7 +128,7 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
 
     result_rows = (
         supabase.table("analysis_results")
-        .select("item_key,status,evidence_snippet,explanation")
+        .select("item_key,status,evidence_snippet,explanation,evidence,similarity")
         .eq("analysis_id", analysis_id)
         .execute()
         .data
@@ -140,19 +159,24 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
         status = result["status"] if result else "missing"
         evidence = result.get("evidence_snippet") if result else None
         explanation = result.get("explanation") if result else None
+        evidence_blocks = _evidence_blocks_from_row(result.get("evidence")) if result else None
         if status == "missing":
             missing_count += 1
         elif status == "partially_met":
             partial_count += 1
         else:
             fully_count += 1
+        sim_raw = result.get("similarity") if result else None
+        best_sim = float(sim_raw) if sim_raw is not None else None
         items.append(
             AnalysisChecklistItem(
                 id=checklist["requirement_id"],
                 itemKey=str(checklist["item_key"]),
                 requirement=checklist["requirement_text"],
                 status=status,
+                bestSimilarity=best_sim,
                 evidence=evidence,
+                evidenceBlocks=evidence_blocks,
                 explanation=explanation,
             )
         )

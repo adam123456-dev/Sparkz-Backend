@@ -30,6 +30,9 @@ create table if not exists public.checklist_items (
   item_kind text not null default 'rule' check (item_kind in ('rule', 'group', 'note')),
   reference_text text not null default '',
   embedding_text text not null,
+  -- Derived at sync time (not separate XLSX columns): lexical pre-filter + UI hints
+  search_keywords text[] not null default '{}'::text[],
+  section_hints text[] not null default '{}'::text[],
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -70,6 +73,8 @@ returns table (
   reference_text text,
   sheet_name text,
   section_path text,
+  search_keywords text[],
+  section_hints text[],
   similarity float
 )
 language sql
@@ -85,6 +90,8 @@ as $$
     ci.reference_text,
     ci.sheet_name,
     ci.section_path,
+    ci.search_keywords,
+    ci.section_hints,
     1 - (ce.embedding <=> query_embedding) as similarity
   from public.checklist_item_embeddings ce
   join public.checklist_items ci on ci.item_key = ce.item_key

@@ -6,6 +6,17 @@ from typing import Iterable
 from app.pipeline.models import RedactedChunk
 
 
+def _heading_guess(text: str, max_len: int = 120) -> str:
+    """Short preview for UI / section hints (PII-redacted chunk text only)."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if len(t) <= max_len:
+        return t
+    cut = t[:max_len].rsplit(" ", 1)[0]
+    return cut if cut else t[:max_len]
+
+
 def build_chunks_from_redacted_pages(
     redacted_pages: list[str],
     chunk_word_target: int = 220,
@@ -29,6 +40,7 @@ def build_chunks_from_redacted_pages(
                         page_number=page_number,
                         text_redacted=chunk_text,
                         text_hash=hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(),
+                        heading_guess=_heading_guess(chunk_text),
                     )
                 )
                 chunk_index += 1

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from functools import lru_cache
-
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,7 +30,7 @@ class Settings(BaseSettings):
     evaluation_evidence_max_chars: int = 2800
     evaluation_requirement_max_chars: int = 1200
     evaluation_explanation_max_chars: int = 320
-    evaluation_use_llm: bool = True
+    evaluation_keyword_prefilter: bool = True
     enable_ocr: bool = False
     upload_dir: str = "./tmp/uploads"
 
@@ -60,6 +59,21 @@ class Settings(BaseSettings):
     @classmethod
     def validate_prompt_caps(cls, value: int) -> int:
         return max(256, int(value))
+
+    @field_validator("evaluation_keyword_prefilter", mode="before")
+    @classmethod
+    def coerce_keyword_prefilter(cls, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v == "":
+                return True
+            if v in ("0", "false", "no", "off"):
+                return False
+            if v in ("1", "true", "yes", "on"):
+                return True
+        return bool(value)
 
     @field_validator("evaluation_explanation_max_chars")
     @classmethod

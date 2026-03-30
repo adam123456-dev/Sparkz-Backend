@@ -15,7 +15,7 @@ This backend contains:
 - `app/api/`: API routing
 - `app/db/supabase.py`: Supabase client factory
 - `app/pipeline/`: PDF → redact → chunk → **embed** (document side only)
-- `app/evaluation/`: vector **top-k retrieval** + optional **LLM verdict** (or similarity fallback)
+- `app/evaluation/`: vector **top-k retrieval** + **LLM final verdict**
 - `app/services/analysis_runner.py`: end-to-end job after upload
 - `app/checklists/`: XLSX parser and checklist domain models
 - `app/core/checklist_type_keys.py`: canonical framework keys (`ifrs`, `frs102`, `frs105`)
@@ -149,6 +149,14 @@ python scripts/sync_checklists_to_supabase.py --scan-root "E:\Tasks\Disclosure-R
 
 By default, this command now also generates OpenAI embeddings and upserts vectors into `checklist_item_embeddings`.
 
+**Retrieval vectors** use **obligation-only** text (`requirement_text_leaf` / `requirement_text`), not the long stored `embedding_text` (framework headers, IDs, references). That aligns rule and PDF chunk embeddings so similarity scores reflect “this passage is about this duty,” not arbitrary thresholds. After changing this logic, **re-embed** existing data:
+
+```bash
+python scripts/sync_checklists_to_supabase.py --scan-root "path/to/Disclosure Checklists" --only-embeddings --refresh-embeddings
+```
+
+Cosine similarity is **never** “100% = compliant.” Identical strings can approach 1.0; paraphrases rarely do. In this project, cosine is used for retrieval ranking only; final status is judged by OpenAI from requirement + extracted evidence.
+
 Optional:
 
 - Target specific files by repeating `--workbook`
@@ -174,7 +182,7 @@ The processing pipeline performs:
 - Chunking
 - OpenAI embeddings for chunks
 - **Top-k** chunk retrieval per requirement (batched reads + NumPy cosine similarity — one matrix multiply per analysis)
-- Status: short **chat completion** per requirement (`OPENAI_CHAT_MODEL`, `EVALUATION_*` caps) when `EVALUATION_USE_LLM=true` and `OPENAI_API_KEY` is set; otherwise **similarity-only** fallback (no chat tokens)
+- Status: OpenAI returns the final `fully_met` / `partially_met` / `missing` verdict for each rule from requirement text + retrieved evidence. Evidence is always extractive from chunks.
 
 Embedding tokens apply to uploaded PDF chunks; checklist rows were embedded at sync time. Chat completions use **low `max_tokens`** and **strict one-word** instructions; answers are normalized with tolerant parsing (plain text, JSON-shaped noise, etc.).
 

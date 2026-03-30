@@ -32,11 +32,14 @@ create table if not exists public.analysis_chunks (
   page_number int not null,
   text_redacted text not null,
   text_hash text not null,
+  heading_guess text not null default '',
+  search_tsv tsvector generated always as (to_tsvector('english', coalesce(text_redacted, ''))) stored,
   created_at timestamptz not null default now(),
   unique (analysis_id, chunk_index)
 );
 
 create index if not exists idx_analysis_chunks_analysis on public.analysis_chunks(analysis_id);
+create index if not exists idx_analysis_chunks_search_tsv on public.analysis_chunks using gin (search_tsv);
 
 create table if not exists public.analysis_chunk_embeddings (
   chunk_id uuid primary key references public.analysis_chunks(id) on delete cascade,
@@ -59,6 +62,8 @@ create table if not exists public.analysis_results (
   item_key text not null references public.checklist_items(item_key) on delete cascade,
   status text not null,
   evidence_snippet text,
+  evidence jsonb,
+  explanation text,
   similarity float not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
