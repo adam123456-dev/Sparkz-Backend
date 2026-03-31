@@ -83,6 +83,84 @@ class ChecklistParserTests(unittest.TestCase):
         self.assertIn("The details required of an advance or credit are", first.requirement_text)
         self.assertIn("its amount", first.requirement_text)
 
+    def test_splits_plain_list_lines_under_alpha_into_atomic_rules(self) -> None:
+        parser = ChecklistWorkbookParser()
+        rows = [
+            RawRow(
+                first="3.01",
+                second="A micro-entity must present:",
+                third="",
+                all_cells=("3.01", "A micro-entity must present:", ""),
+            ),
+            RawRow(
+                first="(a)",
+                second="Statement of financial position format 1.",
+                third="",
+                all_cells=("(a)", "Statement of financial position format 1.", ""),
+            ),
+            RawRow(first="", second="Called up share capital not paid;", third="", all_cells=("", "Called up share capital not paid;", "")),
+            RawRow(first="", second="Fixed assets;", third="", all_cells=("", "Fixed assets;", "")),
+            RawRow(first="", second="Capital and reserves.", third="", all_cells=("", "Capital and reserves.", "")),
+        ]
+        items = parser._extract_items_from_rows(
+            workbook_name="x.xlsx",
+            framework="FRS105",
+            sheet_name="Sheet1",
+            rows=rows,
+        )
+        ids = [it.requirement_id for it in items]
+        self.assertEqual(ids, ["3.01(a)(1)", "3.01(a)(2)", "3.01(a)(3)"])
+        self.assertIn("Called up share capital not paid", items[0].requirement_text)
+        self.assertIn("Fixed assets", items[1].requirement_text)
+        self.assertIn("Capital and reserves", items[2].requirement_text)
+
+    def test_ignores_guidance_rows_below_alpha_rule(self) -> None:
+        parser = ChecklistWorkbookParser()
+        rows = [
+            RawRow(
+                first="4.01",
+                second="The financial statements of a micro-entity shall include:",
+                third="",
+                all_cells=("4.01", "The financial statements of a micro-entity shall include:", ""),
+            ),
+            RawRow(
+                first="(b)",
+                second="an income statement for the reporting period.",
+                third="",
+                all_cells=("(b)", "an income statement for the reporting period.", ""),
+            ),
+            RawRow(
+                first="",
+                second="A micro-entity may use titles for the financial statements other than those used in FRS 105 as long as they are not misleading.",
+                third="",
+                all_cells=("", "A micro-entity may use titles for the financial statements other than those used in FRS 105 as long as they are not misleading.", ""),
+            ),
+            RawRow(
+                first="",
+                second="[Guidance] Table of Equivalence for Company Law terminology",
+                third="",
+                all_cells=("", "[Guidance] Table of Equivalence for Company Law terminology", ""),
+            ),
+            RawRow(
+                first="",
+                second='"Per the above, the standard allows for the usage of other terminology."',
+                third="",
+                all_cells=("", '"Per the above, the standard allows for the usage of other terminology."', ""),
+            ),
+        ]
+        items = parser._extract_items_from_rows(
+            workbook_name="x.xlsx",
+            framework="FRS105",
+            sheet_name="Sheet1",
+            rows=rows,
+        )
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual(item.requirement_id, "4.01(b)")
+        self.assertEqual(item.requirement_text, "The financial statements of a micro-entity shall include: an income statement for the reporting period.")
+        self.assertNotIn("Table of Equivalence", item.requirement_text)
+        self.assertNotIn("other terminology", item.requirement_text)
+
     def test_parses_frs102_1a_workbook(self) -> None:
         workbook = PROJECT_ROOT / "Disclosure Checklists" / "FRS1021A_DC_2025.xlsx"
         self._require_file(workbook)

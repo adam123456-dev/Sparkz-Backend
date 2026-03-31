@@ -54,6 +54,12 @@ NON_REQUIREMENT_PREFIXES = (
     "political donations",
 )
 NOTE_PREFIXES = ("note", "notes")
+GUIDANCE_PREFIXES = (
+    "[guidance]",
+    "guidance",
+    "per the above",
+    "table of equivalence",
+)
 
 
 @dataclass(slots=True)
@@ -171,15 +177,16 @@ class ChecklistWorkbookParser:
         alpha_token = ""
         alpha_text = ""
         had_roman_under_alpha = False
+        alpha_child_count = 0
         note_lines: list[str] = []
         saw_atomic_for_base = False
 
         def emit_alpha_standalone() -> None:
             """Emit base_id + (alpha) when there are no (i)/(ii) children under that alpha."""
-            nonlocal saw_atomic_for_base, alpha_token, alpha_text, had_roman_under_alpha
+            nonlocal saw_atomic_for_base, alpha_token, alpha_text, had_roman_under_alpha, alpha_child_count
             if not base_id or not alpha_token:
                 return
-            if had_roman_under_alpha:
+            if had_roman_under_alpha or alpha_child_count > 0:
                 return
             clause_path = f"({alpha_token})"
             full_id = f"{base_id}{clause_path}"
@@ -205,6 +212,37 @@ class ChecklistWorkbookParser:
             saw_atomic_for_base = True
             alpha_token = ""
             alpha_text = ""
+            had_roman_under_alpha = False
+            alpha_child_count = 0
+
+        def emit_alpha_list_leaf(leaf_text: str) -> None:
+            nonlocal saw_atomic_for_base, had_roman_under_alpha, alpha_child_count
+            if not base_id or not alpha_token:
+                return
+            alpha_child_count += 1
+            token = str(alpha_child_count)
+            clause_path = f"({alpha_token})({token})"
+            full_id = f"{base_id}{clause_path}"
+            composed = self._compose_requirement_text(base_text, alpha_text, leaf_text)
+            if not composed.strip():
+                return
+            items.append(
+                ChecklistItem(
+                    source_workbook=workbook_name,
+                    framework=framework,
+                    sheet_name=sheet_name,
+                    section_path=section_path,
+                    requirement_id=full_id,
+                    requirement_text=composed,
+                    requirement_text_leaf=leaf_text.strip(),
+                    requirement_base_id=base_id,
+                    clause_path=clause_path,
+                    notes_text=" ".join(note_lines).strip(),
+                    reference_text=base_ref,
+                    item_kind="rule",
+                )
+            )
+            saw_atomic_for_base = True
             had_roman_under_alpha = False
 
         def flush_base_if_needed() -> None:
@@ -250,6 +288,7 @@ class ChecklistWorkbookParser:
                 alpha_token = ""
                 alpha_text = ""
                 had_roman_under_alpha = False
+                alpha_child_count = 0
                 note_lines = []
                 saw_atomic_for_base = False
                 section_path = self._build_section_path(section_path, first, second)
@@ -263,6 +302,7 @@ class ChecklistWorkbookParser:
                 alpha_token = ""
                 alpha_text = ""
                 had_roman_under_alpha = False
+                alpha_child_count = 0
                 note_lines = []
                 saw_atomic_for_base = False
                 continue
@@ -285,6 +325,7 @@ class ChecklistWorkbookParser:
                     alpha_token = new_alpha
                     alpha_text = token_text
                     had_roman_under_alpha = False
+                    alpha_child_count = 0
                     continue
 
                 if self._is_roman_token(token):
@@ -314,7 +355,14 @@ class ChecklistWorkbookParser:
                     items.append(item)
                     saw_atomic_for_base = True
                     had_roman_under_alpha = True
+                    alpha_child_count += 1
                     continue
+
+            if alpha_token and not had_roman_under_alpha and self._should_split_alpha_list_item(row):
+                emit_alpha_list_leaf(row_text)
+                if third and third not in base_ref:
+                    base_ref = self._append_sentence(base_ref, third)
+                continue
 
             if alpha_token and not had_roman_under_alpha and row_text:
                 alpha_text = self._append_sentence(alpha_text, row_text)
@@ -351,7 +399,29 @@ class ChecklistWorkbookParser:
 
     def _is_note_row(self, text: str) -> bool:
         lower = text.lower().strip()
-        return any(lower.startswith(prefix) for prefix in NOTE_PREFIXES)
+        if any(lower.startswith(prefix) for prefix in NOTE_PREFIXES):
+            return True
+        if self._is_guidance_like_text(text):
+            return True
+        if any(lower.startswith(prefix) for prefix in GUIDANCE_PREFIXES):
+            return True
+        if text.strip().startswith('"') and text.strip().endswith('"'):
+            return True
+        return False
+
+    def _is_guidance_like_text(self, text: str) -> bool:
+        lower = text.lower().strip()
+        if not lower:
+            return False
+        if any(lower.startswith(prefix) for prefix in GUIDANCE_PREFIXES):
+            return True
+        if text.strip().startswith('"') and text.strip().endswith('"'):
+            return True
+        if "guidance only" in lower:
+            return True
+        if lower.startswith("a micro-entity may use titles for the financial statements other than"):
+            return True
+        return False
 
     def _extract_clause_token(self, text: str) -> tuple[str, str]:
         m = CLAUSE_MARKER_RE.match(text.strip())
@@ -375,6 +445,23 @@ class ChecklistWorkbookParser:
             full = self._append_sentence(full, alpha_text)
         full = self._append_sentence(full, leaf_text)
         return full.strip()
+
+    def _should_split_alpha_list_item(self, row: RawRow) -> bool:
+        first = row.first.strip()
+        second = row.second.strip()
+        if not second:
+            return False
+        if first:
+            return False
+        text = self._row_text(first, second)
+        if not text or self._is_note_row(text) or self._is_guidance_like_text(text):
+            return False
+        if self._extract_clause_token(text)[0]:
+            return False
+        lower = text.lower()
+        if any(word in lower for word in (" must ", " shall ", " should ", " may ", " is ", " are ")):
+            return False
+        return text.endswith(";") or len(text.split()) <= 8
 
     def _is_top_metadata_row(self, first_cell: str) -> bool:
         lower = first_cell.lower()

@@ -8,6 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 from pydantic import ValidationError
 
 from app.core.checklist_type_keys import resolve_framework_form_value
+from app.core.config import get_settings
 from app.core.requirement_order import requirement_id_sort_key
 from app.core.config import get_settings
 from app.db.supabase import get_supabase_client
@@ -16,6 +17,7 @@ from app.schemas.analysis import (
     AnalysisResultResponse,
     AnalysisStatusResponse,
     AnalysisStep,
+    CheckResult,
     EvidenceBlock,
     StartAnalysisResponse,
 )
@@ -35,6 +37,39 @@ def _evidence_blocks_from_row(raw: Any) -> list[EvidenceBlock] | None:
             continue
         try:
             out.append(EvidenceBlock.model_validate(entry))
+        except ValidationError:
+            continue
+    return out or None
+
+
+def _infer_needs_review(
+    *,
+    status: str,
+    check_results: list[CheckResult] | None,
+    best_similarity: float | None,
+    threshold: float,
+) -> bool:
+    if status == "missing":
+        return True
+    crs = check_results or []
+    confidences = [c.confidence for c in crs if c.confidence is not None]
+    if confidences:
+        return min(confidences) < threshold
+    if status == "partially_met":
+        return True
+    sim = best_similarity if best_similarity is not None else 0.0
+    return sim < 0.55
+
+
+def _check_results_from_row(raw: Any) -> list[CheckResult] | None:
+    if raw is None or not isinstance(raw, list):
+        return None
+    out: list[CheckResult] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            out.append(CheckResult.model_validate(entry))
         except ValidationError:
             continue
     return out or None
@@ -128,7 +163,7 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
 
     result_rows = (
         supabase.table("analysis_results")
-        .select("item_key,status,evidence_snippet,explanation,evidence,similarity")
+        .select("item_key,status,evidence_snippet,explanation,evidence,similarity,check_results,coverage")
         .eq("analysis_id", analysis_id)
         .execute()
         .data
@@ -149,6 +184,7 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
         )
     )
     result_by_item = {row["item_key"]: row for row in result_rows}
+    review_threshold = get_settings().evaluation_review_confidence_threshold
 
     items: list[AnalysisChecklistItem] = []
     missing_count = 0
@@ -160,6 +196,9 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
         evidence = result.get("evidence_snippet") if result else None
         explanation = result.get("explanation") if result else None
         evidence_blocks = _evidence_blocks_from_row(result.get("evidence")) if result else None
+        check_results = _check_results_from_row(result.get("check_results")) if result else None
+        coverage_raw = result.get("coverage") if result else None
+        coverage = float(coverage_raw) if coverage_raw is not None else None
         if status == "missing":
             missing_count += 1
         elif status == "partially_met":
@@ -168,6 +207,12 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
             fully_count += 1
         sim_raw = result.get("similarity") if result else None
         best_sim = float(sim_raw) if sim_raw is not None else None
+        needs_review = _infer_needs_review(
+            status=status,
+            check_results=check_results,
+            best_similarity=best_sim,
+            threshold=review_threshold,
+        )
         items.append(
             AnalysisChecklistItem(
                 id=checklist["requirement_id"],
@@ -175,9 +220,12 @@ def get_result(analysis_id: str) -> AnalysisResultResponse:
                 requirement=checklist["requirement_text"],
                 status=status,
                 bestSimilarity=best_sim,
+                coverage=coverage,
+                checkResults=check_results,
                 evidence=evidence,
                 evidenceBlocks=evidence_blocks,
                 explanation=explanation,
+                needsReview=needs_review,
             )
         )
 

@@ -224,6 +224,74 @@ def _insert_chunk_embeddings(
         )
 
 
+_NO_RETRIEVED_TEXT = "(No matching document text.)"
+
+_NO_KEYWORD_MSG = "No document passages matched the rule keyword filter."
+_NO_USABLE_TEXT_MSG = "Retrieval did not return usable document text for this requirement."
+
+
+def _synthesize_row_explanation(check_results: list[dict[str, Any]], *, max_chars: int) -> str | None:
+    """Compact deterministic summary from per-check results only."""
+    if not check_results:
+        return None
+    total = len(check_results)
+    full = sum(1 for r in check_results if r.get("status") == "fully_met")
+    partial = sum(1 for r in check_results if r.get("status") == "partially_met")
+    missing = sum(1 for r in check_results if r.get("status") == "missing")
+
+    if total == 1:
+        reason = str(check_results[0].get("reason") or "").strip()
+        if not reason:
+            return None
+        return reason[: max_chars - 1].rstrip() + "…" if len(reason) > max_chars else reason
+
+    if full == total:
+        text = f"All {total} atomic checks matched."
+    elif missing == total:
+        text = f"All {total} atomic checks missing."
+    else:
+        parts: list[str] = []
+        if full:
+            parts.append(f"{full} met")
+        if partial:
+            parts.append(f"{partial} partial")
+        if missing:
+            parts.append(f"{missing} missing")
+        text = f"{', '.join(parts)} out of {total} checks."
+    return text[: max_chars - 1].rstrip() + "…" if len(text) > max_chars else text
+
+
+def _uniform_reason(check_results: list[dict[str, Any]]) -> str | None:
+    reasons = [str(r.get("reason") or "").strip() for r in check_results]
+    if not reasons:
+        return None
+    first = reasons[0]
+    if first and all(r == first for r in reasons):
+        return first
+    return None
+
+
+def _row_explanation(
+    *,
+    has_lexical_candidates: bool,
+    check_results: list[dict[str, Any]],
+    max_chars: int,
+) -> str | None:
+    if not has_lexical_candidates:
+        return _NO_KEYWORD_MSG
+    uniform = _uniform_reason(check_results)
+    if uniform:
+        return uniform
+    return _synthesize_row_explanation(check_results, max_chars=max_chars)
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    s = (text or "").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 1].rstrip() + "…"
+
+
 def _merge_evidence_texts(chunks: list[TopChunk], max_chars: int) -> tuple[str, float]:
     """Join top chunk texts with optional page labels; return best cosine score."""
     if not chunks or not chunks[0].chunk_id:
@@ -256,11 +324,12 @@ def _merge_evidence_texts(chunks: list[TopChunk], max_chars: int) -> tuple[str, 
 
 def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
     """
-    Lexical keyword gate → cosine top-k on candidate chunks → OpenAI final verdict.
+    Lexical keyword gate → cosine top-k on candidate chunks → OpenAI per-atomic-check verdict.
 
     **Evidence is always extractive** (``build_evidence_blocks`` from retrieved chunks).
-    The chat model is **never** the source of evidence; it only returns status/explanation
-    from requirement text + retrieved evidence text.
+    The chat model must not invent document facts; it returns status, a short reason tied
+    to the evidence, and a confidence score. Row ``explanation`` is assembled only from
+    those per-check reasons (or a deterministic message when retrieval found nothing).
     """
     settings = get_settings()
     item_keys, tops_per_item, lexical_miss = match_checklist_items_top_k(
@@ -274,7 +343,7 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
         return
 
     req_by_key = requirement_text_by_item_key(checklist_type_key, item_keys)
-    kw_by_key = _search_keywords_by_item_key(checklist_type_key, item_keys)
+    rule_checks_by_key = _rule_checks_by_item_key(checklist_type_key, item_keys)
     if not settings.openai_api_key.strip():
         raise RuntimeError("OPENAI_API_KEY is required for final rule judgment.")
 
@@ -283,38 +352,25 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
         merged, best_sim = _merge_evidence_texts(tops, settings.evaluation_evidence_max_chars)
         evidence_json = build_evidence_blocks(tops)
         requirement = req_by_key.get(item_key, "")[: settings.evaluation_requirement_max_chars]
-        evidence_for_model = merged if merged.strip() else "(No matching document text.)"
-        keywords = kw_by_key.get(item_key, [])
-        keyword_score = _keyword_match_ratio(keywords, merged)
-        semantic_score = max(0.0, min(1.0, float(best_sim)))
-        combined_score = 0.5 * keyword_score + 0.5 * semantic_score
+        evidence_for_model = merged if merged.strip() else _NO_RETRIEVED_TEXT
+        checks = _normalize_rule_checks(rule_checks_by_key.get(item_key), fallback_requirement=requirement)
+        check_results = _evaluate_checks_for_rule(
+            checks=checks,
+            requirement_text=requirement,
+            evidence_text=evidence_for_model,
+            has_lexical_candidates=not kw_miss,
+            openai_api_key=settings.openai_api_key,
+            openai_chat_model=settings.openai_chat_model,
+            explanation_max_chars=settings.evaluation_explanation_max_chars,
+        )
+        status, coverage = _aggregate_rule_status(check_results)
+        explanation = _row_explanation(
+            has_lexical_candidates=not kw_miss,
+            check_results=check_results,
+            max_chars=settings.evaluation_row_explanation_max_chars,
+        )
 
-        if combined_score >= 0.65:
-            status = "fully_met"
-            explanation = None
-        elif combined_score < 0.30:
-            status = "missing"
-            explanation = None
-        else:
-            try:
-                raw = judge_disclosure(
-                    api_key=settings.openai_api_key,
-                    model=settings.openai_chat_model,
-                    requirement_text=requirement,
-                    evidence_text=evidence_for_model,
-                )
-                parsed_status, _ = parse_judge_response(
-                    raw,
-                    explanation_max_chars=settings.evaluation_explanation_max_chars,
-                )
-                status = parsed_status or "missing"
-                explanation = None
-            except Exception:  # noqa: BLE001
-                logger.exception("LLM judge failed for item_key=%s; defaulting to missing", item_key)
-                status = "missing"
-                explanation = None
-
-        evidence_snippet = merged[:900] if merged.strip() and status != "missing" else None
+        evidence_snippet = _truncate_text(merged, 160) if merged.strip() and status != "missing" else None
         evidence_value = evidence_json if status != "missing" and evidence_json else None
         results_payload.append(
             {
@@ -323,6 +379,8 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
                 "status": status,
                 "evidence_snippet": evidence_snippet,
                 "evidence": evidence_value,
+                "check_results": check_results,
+                "coverage": coverage,
                 "explanation": explanation,
                 "similarity": best_sim,
             }
@@ -358,17 +416,17 @@ def _upsert_in_batches(
         )
 
 
-def _search_keywords_by_item_key(checklist_type_key: str, item_keys: list[str]) -> dict[str, list[str]]:
+def _rule_checks_by_item_key(checklist_type_key: str, item_keys: list[str]) -> dict[str, list[dict[str, str]]]:
     if not item_keys:
         return {}
     supabase = get_supabase_client()
-    out: dict[str, list[str]] = {}
+    out: dict[str, list[dict[str, str]]] = {}
     batch_size = 200
     for start in range(0, len(item_keys), batch_size):
         batch = item_keys[start : start + batch_size]
         rows = (
             supabase.table("checklist_items")
-            .select("item_key,search_keywords")
+            .select("item_key,rule_checks")
             .eq("checklist_type_key", checklist_type_key)
             .in_("item_key", batch)
             .execute()
@@ -376,24 +434,114 @@ def _search_keywords_by_item_key(checklist_type_key: str, item_keys: list[str]) 
             or []
         )
         for row in rows:
-            raw = row.get("search_keywords")
+            raw = row.get("rule_checks")
             if isinstance(raw, list):
-                out[str(row["item_key"])] = [str(x).strip().lower() for x in raw if str(x).strip()]
+                out[str(row["item_key"])] = [x for x in raw if isinstance(x, dict)]
             else:
                 out[str(row["item_key"])] = []
     return out
 
 
-def _keyword_match_ratio(keywords: list[str], evidence_text: str) -> float:
-    if not keywords:
-        return 0.0
-    hay = (evidence_text or "").lower()
-    if not hay.strip():
-        return 0.0
-    matched = 0
-    for kw in keywords:
-        token = (kw or "").strip().lower()
-        if token and token in hay:
-            matched += 1
-    return matched / max(1, len(keywords))
+def _normalize_rule_checks(raw: list[dict[str, str]] | None, *, fallback_requirement: str) -> list[dict[str, str]]:
+    if not raw:
+        label = (fallback_requirement or "").strip() or "Disclosure requirement"
+        return [{"check_id": "c1", "label": label, "kind": "required"}]
+    out: list[dict[str, str]] = []
+    for idx, entry in enumerate(raw, start=1):
+        label = str(entry.get("label") or "").strip()
+        if not label:
+            continue
+        cid = str(entry.get("check_id") or f"c{idx}").strip() or f"c{idx}"
+        out.append({"check_id": cid, "label": label, "kind": "required"})
+    if not out:
+        label = (fallback_requirement or "").strip() or "Disclosure requirement"
+        return [{"check_id": "c1", "label": label, "kind": "required"}]
+    return out
+
+
+def _evaluate_checks_for_rule(
+    *,
+    checks: list[dict[str, str]],
+    requirement_text: str,
+    evidence_text: str,
+    has_lexical_candidates: bool,
+    openai_api_key: str,
+    openai_chat_model: str,
+    explanation_max_chars: int,
+) -> list[dict[str, Any]]:
+    trimmed = (evidence_text or "").strip()
+    if not has_lexical_candidates:
+        return [
+            {
+                "checkId": c["check_id"],
+                "label": c["label"],
+                "status": "missing",
+                "reason": _NO_KEYWORD_MSG,
+                "confidence": None,
+            }
+            for c in checks
+        ]
+    if not trimmed or trimmed == _NO_RETRIEVED_TEXT:
+        return [
+            {
+                "checkId": c["check_id"],
+                "label": c["label"],
+                "status": "missing",
+                "reason": _NO_USABLE_TEXT_MSG,
+                "confidence": None,
+            }
+            for c in checks
+        ]
+
+    out: list[dict[str, Any]] = []
+    for c in checks:
+        check_label = c["label"]
+        check_prompt = f"{requirement_text}\n\nAtomic check: {check_label}"
+        try:
+            raw = judge_disclosure(
+                api_key=openai_api_key,
+                model=openai_chat_model,
+                requirement_text=check_prompt,
+                evidence_text=evidence_text,
+            )
+            verdict = parse_judge_response(raw, explanation_max_chars=explanation_max_chars)
+            if verdict.status:
+                status = verdict.status
+                reason = verdict.reason
+                confidence = verdict.confidence
+                if status == "missing" and not reason:
+                    reason = "The excerpts do not support this atomic check."
+            else:
+                status = "missing"
+                reason = "The model returned an invalid or empty judgment."
+                confidence = None
+        except Exception:  # noqa: BLE001
+            logger.exception("LLM check evaluation failed for check_id=%s", c["check_id"])
+            status = "missing"
+            reason = "Automatic evaluation failed (upstream error)."
+            confidence = None
+        out.append(
+            {
+                "checkId": c["check_id"],
+                "label": check_label,
+                "status": status,
+                "reason": reason,
+                "confidence": confidence,
+            }
+        )
+    return out
+
+
+def _aggregate_rule_status(check_results: list[dict[str, Any]]) -> tuple[str, float]:
+    if not check_results:
+        return "missing", 0.0
+    total = len(check_results)
+    full = sum(1 for r in check_results if r.get("status") == "fully_met")
+    partial = sum(1 for r in check_results if r.get("status") == "partially_met")
+    coverage = (full + 0.5 * partial) / total
+    if full == total:
+        return "fully_met", coverage
+    if full == 0 and partial == 0:
+        return "missing", coverage
+    return "partially_met", coverage
 

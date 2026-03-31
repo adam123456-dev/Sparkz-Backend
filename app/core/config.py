@@ -27,9 +27,11 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
     evaluation_top_k: int = 3
-    evaluation_evidence_max_chars: int = 2800
+    evaluation_evidence_max_chars: int = 900
     evaluation_requirement_max_chars: int = 1200
-    evaluation_explanation_max_chars: int = 320
+    evaluation_explanation_max_chars: int = 120
+    evaluation_row_explanation_max_chars: int = 220
+    evaluation_review_confidence_threshold: float = 0.72
     evaluation_keyword_prefilter: bool = True
     enable_ocr: bool = False
     upload_dir: str = "./tmp/uploads"
@@ -79,6 +81,17 @@ class Settings(BaseSettings):
     @classmethod
     def validate_explanation_cap(cls, value: int) -> int:
         return max(64, int(value))
+
+    @field_validator("evaluation_row_explanation_max_chars")
+    @classmethod
+    def validate_row_explanation_cap(cls, value: int) -> int:
+        return max(256, int(value))
+
+    @field_validator("evaluation_review_confidence_threshold")
+    @classmethod
+    def validate_review_threshold(cls, value: float) -> float:
+        x = float(value)
+        return max(0.05, min(0.99, x))
 
     @property
     def cors_origins(self) -> list[str]:

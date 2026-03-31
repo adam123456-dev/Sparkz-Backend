@@ -63,6 +63,8 @@ create table if not exists public.analysis_results (
   status text not null,
   evidence_snippet text,
   evidence jsonb,
+  check_results jsonb not null default '[]'::jsonb,
+  coverage float not null default 0,
   explanation text,
   similarity float not null default 0,
   created_at timestamptz not null default now(),
@@ -72,6 +74,11 @@ create table if not exists public.analysis_results (
 
 create index if not exists idx_analysis_results_analysis on public.analysis_results(analysis_id);
 create index if not exists idx_analysis_results_status on public.analysis_results(status);
+
+alter table if exists public.analysis_results
+  add column if not exists check_results jsonb not null default '[]'::jsonb;
+alter table if exists public.analysis_results
+  add column if not exists coverage float not null default 0;
 
 create or replace function public.match_analysis_chunks (
   query_embedding vector(1536),

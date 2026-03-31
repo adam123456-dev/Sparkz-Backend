@@ -8,9 +8,16 @@ from urllib.request import Request, urlopen
 logger = logging.getLogger(__name__)
 
 _SYSTEM = (
-    "Return JSON only. Key: status (string, exactly FULLY or PARTIAL or NONE). "
-    "FULLY if evidence clearly satisfies the requirement; PARTIAL if only some; "
-    "NONE if evidence does not support it or is absent."
+    "You assess whether retrieved document excerpts satisfy a disclosure requirement. "
+    "Return JSON only with keys: "
+    'status (string, exactly FULLY or PARTIAL or NONE), '
+    "reason (string, max 12 words), "
+    "confidence (number from 0 to 1). "
+    "FULLY if the evidence clearly covers the atomic check; PARTIAL if only partly; "
+    "NONE if the evidence does not support it or is absent. "
+    "The reason must only restate what is supported by the Evidence block below—do not "
+    "use outside knowledge or invent facts. Keep the reason very short and direct. "
+    "If status is NONE, say what is missing in a few words only."
 )
 
 
@@ -28,7 +35,7 @@ def judge_disclosure(
         "Evidence from document (retrieved chunks; each paragraph may start with \"Page N:\" "
         "for the PDF page that chunk came from):\n"
         f"{ev}\n\n"
-        'Respond with JSON: {"status":"FULLY|PARTIAL|NONE"}'
+        'Respond with JSON: {"status":"FULLY|PARTIAL|NONE","reason":"...","confidence":0.0}'
     )
 
     payload = {
@@ -37,7 +44,7 @@ def judge_disclosure(
             {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": user},
         ],
-        "max_tokens": 96,
+        "max_tokens": 80,
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }

@@ -30,6 +30,8 @@ create table if not exists public.checklist_items (
   item_kind text not null default 'rule' check (item_kind in ('rule', 'group', 'note')),
   reference_text text not null default '',
   embedding_text text not null,
+  -- Rule decomposition for structured evaluation (atomic checks generated at sync time)
+  rule_checks jsonb not null default '[]'::jsonb,
   -- Derived at sync time (not separate XLSX columns): lexical pre-filter + UI hints
   search_keywords text[] not null default '{}'::text[],
   section_hints text[] not null default '{}'::text[],
@@ -39,6 +41,9 @@ create table if not exists public.checklist_items (
 
 create index if not exists idx_checklist_items_type on public.checklist_items(checklist_type_key);
 create index if not exists idx_checklist_items_req_id on public.checklist_items(requirement_id);
+
+alter table if exists public.checklist_items
+  add column if not exists rule_checks jsonb not null default '[]'::jsonb;
 
 create table if not exists public.checklist_item_embeddings (
   item_key text primary key references public.checklist_items(item_key) on delete cascade,

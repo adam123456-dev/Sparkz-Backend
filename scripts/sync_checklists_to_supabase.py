@@ -4,10 +4,14 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import sys
+import time
 from dataclasses import asdict
+from http.client import RemoteDisconnected
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,13 +20,32 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.checklists import ChecklistItem, parse_workbook
-from app.checklists.llm_keywords import generate_rule_keywords_with_openai
+from app.checklists.llm_rule_checks import generate_rule_checks_with_openai
 from app.checklists.retrieval_embedding import retrieval_embedding_source_text
 from app.core.checklist_type_keys import display_name_for_key, type_key_from_workbook_path
 
 _SUPABASE_CLIENT = None
 _SETTINGS = None
 logger = logging.getLogger(__name__)
+_TOKEN = re.compile(r"[a-z0-9]+(?:'[a-z]+)?", re.IGNORECASE)
+_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "that",
+    "with",
+    "from",
+    "this",
+    "have",
+    "has",
+    "must",
+    "shall",
+    "under",
+    "above",
+    "year",
+    "question",
+}
+_WEAK = {"verify", "check", "ensure", "confirm", "presence", "indicates", "correct"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -175,40 +198,70 @@ def rows_for_workbook(path: Path) -> tuple[str, str, list[dict[str, Any]]]:
         row["item_key"] = item_key_for(type_key, item)
         row["checklist_type_key"] = type_key
         row["embedding_text"] = item.embedding_text
-        keywords, section_hints = _build_search_keywords_for_item(item, settings)
-        row["search_keywords"] = keywords
+        rule_checks = _build_rule_checks_for_item(item, settings)
+        row["rule_checks"] = rule_checks
+        row["search_keywords"] = _keywords_from_rule_checks(rule_checks)
+        section_hints: list[str] = []
         row["section_hints"] = section_hints
         rows.append(row)
         if idx % 20 == 0 or idx == total_items:
-            print(f"  - keyword generation progress: {idx}/{total_items}", flush=True)
+            print(f"  - rule decomposition progress: {idx}/{total_items}", flush=True)
 
     return type_key, display_name, rows
 
 
-def _build_search_keywords_for_item(item: ChecklistItem, settings: Any) -> tuple[list[str], list[str]]:
-    """
-    OpenAI-generated keyword tiers only.
-    Stored ``search_keywords`` keeps strict terms first, then likely terms.
-    """
-    print("*****************")
-    print("item", item)
-    print("*****************")
-    section_hints: list[str] = []
+def _build_rule_checks_for_item(item: ChecklistItem, settings: Any) -> list[dict[str, str]]:
     key = (settings.openai_api_key or "").strip()
     if not key:
-        return [], section_hints
+        return []
     try:
-        keywords = generate_rule_keywords_with_openai(
+        checks = generate_rule_checks_with_openai(
             api_key=key,
             model=settings.openai_chat_model,
             requirement_text=item.requirement_text,
             requirement_text_leaf=item.requirement_text_leaf,
-            reference_text=item.reference_text,
         )
-        return keywords, section_hints
+        if checks:
+            return checks
+        # One retry with the leaf as primary text when first attempt is weak/empty.
+        if item.requirement_text_leaf.strip():
+            checks = generate_rule_checks_with_openai(
+                api_key=key,
+                model=settings.openai_chat_model,
+                requirement_text=item.requirement_text_leaf,
+                requirement_text_leaf=item.requirement_text_leaf,
+            )
+            if checks:
+                return checks
     except Exception as exc:  # noqa: BLE001
-        logger.warning("OpenAI keyword generation failed for %s: %s", item.requirement_id, exc)
-    return [], section_hints
+        logger.warning("OpenAI rule decomposition failed for %s: %s", item.requirement_id, exc)
+    return []
+
+
+def _keywords_from_rule_checks(rule_checks: list[dict[str, str]], max_keywords: int = 36) -> list[str]:
+    """
+    Derive retrieval keywords from rule-check labels.
+    Keeps one generation source (rule_checks) and avoids a second LLM keyword pass.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for chk in rule_checks:
+        label = str(chk.get("label") or "")
+        for m in _TOKEN.finditer(label):
+            tok = m.group(0).lower()
+            if len(tok) < 3:
+                continue
+            if tok in _STOPWORDS or tok in _WEAK:
+                continue
+            if tok.isdigit():
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= max_keywords:
+                return out
+    return out
 
 
 def dedupe_rows_by_item_key(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -301,10 +354,51 @@ def build_openai_embeddings(texts: list[str]) -> list[list[float]]:
         },
         method="POST",
     )
-    with urlopen(request, timeout=120) as response:  # nosec B310
-        body = json.loads(response.read().decode("utf-8"))
+    body = _openai_request_with_retry(request, max_retries=5, base_sleep_seconds=1.2)
     data = body.get("data", [])
     return [item["embedding"] for item in data]
+
+
+def _openai_request_with_retry(
+    request: Request,
+    *,
+    max_retries: int,
+    base_sleep_seconds: float,
+) -> dict[str, Any]:
+    """
+    Retry transient OpenAI API failures (network reset / remote disconnect / 5xx / 429).
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urlopen(request, timeout=120) as response:  # nosec B310
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            # Retry only throttling/server-side failures.
+            if exc.code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt >= max_retries:
+                raise
+            wait_s = base_sleep_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "OpenAI embeddings HTTP %s (attempt %s/%s). Retrying in %.1fs.",
+                exc.code,
+                attempt,
+                max_retries,
+                wait_s,
+            )
+            time.sleep(wait_s)
+        except (URLError, TimeoutError, RemoteDisconnected, ConnectionResetError) as exc:
+            if attempt >= max_retries:
+                raise
+            wait_s = base_sleep_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "OpenAI embeddings network error %s (attempt %s/%s). Retrying in %.1fs.",
+                type(exc).__name__,
+                attempt,
+                max_retries,
+                wait_s,
+            )
+            time.sleep(wait_s)
 
 
 def upsert_embeddings(type_key: str, batch_rows: list[dict[str, str]], embeddings: list[list[float]]) -> int:
