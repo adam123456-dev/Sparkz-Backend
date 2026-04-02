@@ -18,6 +18,13 @@ from app.db.supabase import get_supabase_client
 from app.db.supabase_retry import execute_with_retry
 from app.evaluation.embedding_vector import embedding_to_float_vector
 from app.evaluation.lexical import build_inverted_index, candidate_indices_for_keywords
+from app.evaluation.retrieval_rerank import (
+    final_rank_score,
+    heading_match_score,
+    keyword_overlap_score,
+    section_hint_score,
+    token_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +34,12 @@ class TopChunk:
     chunk_id: str
     page_number: int
     text_redacted: str
+    heading_guess: str
     similarity: float
+    section_title: str = ""
+    statement_area: str = ""
+    chunk_type: str = ""
+    note_number: str = ""
 
 
 def _paginate_eq(
@@ -120,15 +132,147 @@ def _keywords_by_item_key(checklist_type_key: str) -> dict[str, list[str]]:
     return out
 
 
-_EMPTY = TopChunk(chunk_id="", page_number=0, text_redacted="", similarity=0.0)
+def _section_hints_by_item_key(checklist_type_key: str) -> dict[str, list[str]]:
+    try:
+        rows = _paginate_eq(
+            "checklist_items",
+            "item_key,section_hints",
+            "checklist_type_key",
+            checklist_type_key,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not read checklist_items.section_hints (%s). Falling back to empty hints.",
+            exc,
+        )
+        rows = _paginate_eq("checklist_items", "item_key", "checklist_type_key", checklist_type_key)
+        return {str(r["item_key"]): [] for r in rows}
+    out: dict[str, list[str]] = {}
+    for row in rows:
+        ik = str(row["item_key"])
+        raw = row.get("section_hints")
+        if raw is None:
+            out[ik] = []
+        elif isinstance(raw, list):
+            out[ik] = [str(x).strip().lower() for x in raw if str(x).strip()]
+        elif isinstance(raw, str):
+            s = raw.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        out[ik] = [str(x).strip().lower() for x in parsed if str(x).strip()]
+                    else:
+                        out[ik] = []
+                except json.JSONDecodeError:
+                    out[ik] = []
+            else:
+                out[ik] = []
+        else:
+            out[ik] = []
+    return out
 
 
+_EMPTY = TopChunk(chunk_id="", page_number=0, text_redacted="", heading_guess="", similarity=0.0)
+
+
+def _chunk_search_text(meta: dict[str, Any]) -> str:
+    return " ".join(
+        str(meta.get(key) or "")
+        for key in ("heading_guess", "section_title", "statement_area", "chunk_type", "note_number", "text_redacted")
+        if str(meta.get(key) or "").strip()
+    ).strip()
+
+
+def _metadata_bias_indices(
+    *,
+    section_hints: list[str],
+    chunk_metas: list[dict[str, Any]],
+    limit: int,
+) -> np.ndarray:
+    if not section_hints:
+        return np.array([], dtype=np.int64)
+    scored: list[tuple[float, int]] = []
+    for idx, meta in enumerate(chunk_metas):
+        heading_guess = str(meta.get("heading_guess") or "")
+        chunk_text = " ".join(
+            str(meta.get(key) or "")
+            for key in ("section_title", "statement_area", "chunk_type", "note_number", "text_redacted")
+        )
+        score = section_hint_score(section_hints, heading_guess, chunk_text)
+        if score > 0:
+            scored.append((score, idx))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return np.array([idx for _, idx in scored[: max(1, limit)]], dtype=np.int64)
 def _normalize_keyword_list(raw: Any) -> list[str]:
     if raw is None:
         return []
     if isinstance(raw, list):
         return [str(x).strip().lower() for x in raw if str(x).strip()]
     return []
+
+
+def _rank_and_select_candidates(
+    *,
+    rule_vec: np.ndarray,
+    candidate_indices: np.ndarray,
+    chunk_mat_norm: np.ndarray,
+    chunk_metas: list[dict[str, Any]],
+    chunk_ids_in_order: list[str],
+    keywords: list[str],
+    section_hints: list[str],
+    final_k: int,
+) -> list[TopChunk]:
+    if candidate_indices.size == 0:
+        return [_EMPTY] * final_k
+
+    selected_idx, semantic_scores = _top_k_cosine_on_columns(
+        rule_vec,
+        chunk_mat_norm,
+        candidate_indices,
+        candidate_indices.size,
+    )
+    ranked: list[tuple[float, TopChunk]] = []
+    seen_ids: set[str] = set()
+    for raw_idx, sem in zip(selected_idx.tolist(), semantic_scores.tolist()):
+        meta = chunk_metas[int(raw_idx)]
+        chunk_id = chunk_ids_in_order[int(raw_idx)]
+        if chunk_id in seen_ids:
+            continue
+        seen_ids.add(chunk_id)
+        heading_guess = str(meta.get("heading_guess") or "")
+        chunk_text = str(meta.get("text_redacted") or "")
+        chunk_search_text = _chunk_search_text(meta)
+        chunk_tokens = token_set(chunk_search_text)
+        key_score = keyword_overlap_score(keywords, chunk_tokens)
+        heading_score = heading_match_score(keywords, heading_guess)
+        section_score = section_hint_score(section_hints, heading_guess, chunk_search_text)
+        final_score = final_rank_score(
+            semantic_similarity=float(sem),
+            keyword_overlap=min(1.0, key_score + 0.35 * section_score),
+            heading_match=max(heading_score, section_score),
+        )
+        ranked.append(
+            (
+                final_score,
+                TopChunk(
+                    chunk_id=chunk_id,
+                    page_number=int(meta.get("page_number") or 0),
+                    text_redacted=str(meta.get("text_redacted") or ""),
+                    heading_guess=heading_guess,
+                    similarity=float(sem),
+                    section_title=str(meta.get("section_title") or ""),
+                    statement_area=str(meta.get("statement_area") or ""),
+                    chunk_type=str(meta.get("chunk_type") or ""),
+                    note_number=str(meta.get("note_number") or ""),
+                ),
+            )
+        )
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    out = [chunk for _, chunk in ranked[:final_k]]
+    while len(out) < final_k:
+        out.append(_EMPTY)
+    return out
 
 
 def _top_k_cosine_on_columns(
@@ -156,6 +300,7 @@ def match_checklist_items_top_k(
     checklist_type_key: str,
     top_k: int,
     *,
+    candidate_k: int = 12,
     keyword_prefilter: bool = True,
 ) -> tuple[list[str], list[list[TopChunk]], list[bool]]:
     """
@@ -167,11 +312,12 @@ def match_checklist_items_top_k(
         True when the rule had non-empty keywords but **no** chunk matched any token.
     """
     k = max(1, int(top_k))
+    candidate_count = max(k, int(candidate_k))
     use_kw = keyword_prefilter
 
     chunk_text_rows = _paginate_eq(
         "analysis_chunks",
-        "id,page_number,text_redacted",
+        "id,page_number,text_redacted,heading_guess,section_title,statement_area,chunk_type,note_number",
         "analysis_id",
         analysis_id,
     )
@@ -187,6 +333,7 @@ def match_checklist_items_top_k(
         return [], [], []
 
     keywords_map = _keywords_by_item_key(checklist_type_key)
+    section_hints_map = _section_hints_by_item_key(checklist_type_key)
 
     item_keys = [str(r["item_key"]) for r in checklist_emb_rows]
 
@@ -214,7 +361,10 @@ def match_checklist_items_top_k(
     if not chunk_embs:
         return item_keys, [[_EMPTY] * k for _ in item_keys], [False] * len(item_keys)
 
-    chunk_texts = [str(m.get("text_redacted") or "") for m in chunk_metas]
+    chunk_texts = [
+        _chunk_search_text(m)
+        for m in chunk_metas
+    ]
     inverted = build_inverted_index(chunk_texts)
 
     chunk_mat = np.stack([embedding_to_float_vector(v) for v in chunk_embs], axis=0)
@@ -233,34 +383,52 @@ def match_checklist_items_top_k(
         ik = item_keys[i]
         rule_vec = checklist_mat[i]
         keywords = _normalize_keyword_list(keywords_map.get(ik))
+        section_hints = _normalize_keyword_list(section_hints_map.get(ik))
 
         lexical_miss = False
+        global_idx, _ = _top_k_cosine_on_columns(rule_vec, chunk_mat, all_col_idx, candidate_count)
+        metadata_idx = _metadata_bias_indices(
+            section_hints=section_hints,
+            chunk_metas=chunk_metas,
+            limit=candidate_count,
+        )
         if use_kw and keywords:
             cand_set = candidate_indices_for_keywords(keywords, inverted)
             if not cand_set:
                 lexical_miss = True
-                tops_per_item.append([_EMPTY] * k)
-                lexical_miss_flags.append(True)
-                continue
-            col_idx = np.array(sorted(cand_set), dtype=np.int64)
-        else:
-            col_idx = all_col_idx
-
-        picked_idx, scores = _top_k_cosine_on_columns(rule_vec, chunk_mat, col_idx, k)
-        row_chunks: list[TopChunk] = []
-        for j in range(picked_idx.size):
-            ji = int(picked_idx[j])
-            meta = chunk_metas[ji]
-            row_chunks.append(
-                TopChunk(
-                    chunk_id=chunk_ids_in_order[ji],
-                    page_number=int(meta.get("page_number") or 0),
-                    text_redacted=str(meta.get("text_redacted") or ""),
-                    similarity=float(scores[j]),
+                col_idx = np.unique(np.concatenate([metadata_idx, global_idx])) if metadata_idx.size else global_idx
+            else:
+                shortlist_idx = np.array(sorted(cand_set), dtype=np.int64)
+                shortlist_top_idx, _ = _top_k_cosine_on_columns(
+                    rule_vec,
+                    chunk_mat,
+                    shortlist_idx,
+                    candidate_count,
                 )
-            )
-        while len(row_chunks) < k:
-            row_chunks.append(_EMPTY)
+                if shortlist_top_idx.size < candidate_count:
+                    extra = [shortlist_top_idx, global_idx]
+                    if metadata_idx.size:
+                        extra.append(metadata_idx)
+                    col_idx = np.unique(np.concatenate(extra))
+                else:
+                    col_idx = (
+                        np.unique(np.concatenate([shortlist_top_idx, metadata_idx]))
+                        if metadata_idx.size
+                        else shortlist_top_idx
+                    )
+        else:
+            col_idx = np.unique(np.concatenate([metadata_idx, global_idx])) if metadata_idx.size else global_idx
+
+        row_chunks = _rank_and_select_candidates(
+            rule_vec=rule_vec,
+            candidate_indices=col_idx,
+            chunk_mat_norm=chunk_mat,
+            chunk_metas=chunk_metas,
+            chunk_ids_in_order=chunk_ids_in_order,
+            keywords=keywords,
+            section_hints=section_hints,
+            final_k=k,
+        )
         tops_per_item.append(row_chunks[:k])
         lexical_miss_flags.append(lexical_miss)
 

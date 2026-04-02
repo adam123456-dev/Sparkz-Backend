@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.checklists import ChecklistItem, parse_workbook
+from app.checklists.llm_keywords import generate_retrieval_hints_with_openai
 from app.checklists.llm_rule_checks import generate_rule_checks_with_openai
 from app.checklists.retrieval_embedding import retrieval_embedding_source_text
 from app.core.checklist_type_keys import display_name_for_key, type_key_from_workbook_path
@@ -30,22 +31,81 @@ logger = logging.getLogger(__name__)
 _TOKEN = re.compile(r"[a-z0-9]+(?:'[a-z]+)?", re.IGNORECASE)
 _STOPWORDS = {
     "the",
+    "a",
+    "an",
     "and",
+    "any",
+    "all",
+    "at",
+    "by",
+    "be",
+    "been",
+    "being",
+    "can",
+    "covered",
+    "date",
+    "dates",
+    "disclose",
+    "disclosed",
+    "disclosure",
+    "disclosures",
+    "end",
+    "entity",
+    "financial",
+    "following",
     "for",
+    "is",
+    "include",
+    "includes",
+    "including",
+    "information",
+    "items",
+    "name",
+    "period",
+    "position",
+    "report",
+    "reporting",
+    "required",
+    "requirement",
+    "of",
+    "or",
+    "are",
+    "shall",
+    "state",
+    "stated",
+    "statements",
     "that",
+    "there",
+    "these",
     "with",
     "from",
     "this",
     "have",
     "has",
     "must",
-    "shall",
     "under",
     "above",
     "year",
     "question",
 }
 _WEAK = {"verify", "check", "ensure", "confirm", "presence", "indicates", "correct"}
+_GENERIC_HINTS = {
+    "disclosure",
+    "disclosures",
+    "financial statements",
+    "reporting period",
+    "period",
+    "date",
+    "details",
+}
+_DIRECTOR_ADVANCE_CONTEXT_RE = re.compile(
+    r"advances?\s+and\s+credits?\s+granted.*?directors?",
+    re.IGNORECASE,
+)
+_DIRECTOR_GUARANTEE_CONTEXT_RE = re.compile(
+    r"guarantees?\s+of\s+any\s+kind.*?directors?",
+    re.IGNORECASE,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,9 +260,9 @@ def rows_for_workbook(path: Path) -> tuple[str, str, list[dict[str, Any]]]:
         row["embedding_text"] = item.embedding_text
         rule_checks = _build_rule_checks_for_item(item, settings)
         row["rule_checks"] = rule_checks
-        row["search_keywords"] = _keywords_from_rule_checks(rule_checks)
-        section_hints: list[str] = []
-        row["section_hints"] = section_hints
+        retrieval_hints = _build_retrieval_hints_for_item(item, settings)
+        row["search_keywords"] = retrieval_hints["keywords"]
+        row["section_hints"] = retrieval_hints["section_hints"]
         rows.append(row)
         if idx % 20 == 0 or idx == total_items:
             print(f"  - rule decomposition progress: {idx}/{total_items}", flush=True)
@@ -211,6 +271,9 @@ def rows_for_workbook(path: Path) -> tuple[str, str, list[dict[str, Any]]]:
 
 
 def _build_rule_checks_for_item(item: ChecklistItem, settings: Any) -> list[dict[str, str]]:
+    deterministic = _deterministic_rule_checks_for_item(item)
+    if deterministic:
+        return deterministic
     key = (settings.openai_api_key or "").strip()
     if not key:
         return []
@@ -220,6 +283,7 @@ def _build_rule_checks_for_item(item: ChecklistItem, settings: Any) -> list[dict
             model=settings.openai_chat_model,
             requirement_text=item.requirement_text,
             requirement_text_leaf=item.requirement_text_leaf,
+            clause_path=item.clause_path,
         )
         if checks:
             return checks
@@ -230,12 +294,172 @@ def _build_rule_checks_for_item(item: ChecklistItem, settings: Any) -> list[dict
                 model=settings.openai_chat_model,
                 requirement_text=item.requirement_text_leaf,
                 requirement_text_leaf=item.requirement_text_leaf,
+                clause_path=item.clause_path,
             )
             if checks:
                 return checks
     except Exception as exc:  # noqa: BLE001
         logger.warning("OpenAI rule decomposition failed for %s: %s", item.requirement_id, exc)
     return []
+
+
+def _deterministic_rule_checks_for_item(item: ChecklistItem) -> list[dict[str, str]]:
+    leaf = _resolved_atomic_leaf_label(item)
+    if not leaf:
+        return []
+    if not item.clause_path:
+        return []
+    if leaf == _clean_hint_phrase(item.requirement_text):
+        return []
+    return [{"check_id": "c1", "label": leaf, "kind": "required"}]
+
+
+def _build_retrieval_hints_for_item(item: ChecklistItem, settings: Any) -> dict[str, list[str]]:
+    fallback = {
+        "keywords": _fallback_keywords_for_item(item),
+        "section_hints": _fallback_section_hints_for_item(item),
+    }
+    key = (settings.openai_api_key or "").strip()
+    if not key:
+        return fallback
+    try:
+        hints = generate_retrieval_hints_with_openai(
+            api_key=key,
+            model=settings.openai_chat_model,
+            requirement_text=item.requirement_text,
+            requirement_text_leaf=item.requirement_text_leaf,
+            reference_text=item.reference_text,
+            sheet_name=item.sheet_name,
+            section_path=item.section_path,
+        )
+        keywords = hints.get("keywords") or []
+        section_hints = hints.get("section_hints") or []
+        if keywords or section_hints:
+            return {
+                "keywords": keywords[:10],
+                "section_hints": [h for h in section_hints if h not in _GENERIC_HINTS][:4],
+            }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OpenAI retrieval hints failed for %s: %s", item.requirement_id, exc)
+    return fallback
+
+
+def _clean_hint_phrase(text: str) -> str:
+    words = [
+        m.group(0).lower()
+        for m in _TOKEN.finditer(text or "")
+        if m.group(0).lower() not in _STOPWORDS and m.group(0).lower() not in _WEAK
+    ]
+    if not words:
+        return ""
+    phrase = " ".join(words[:6]).strip()
+    return phrase
+
+
+def _resolved_atomic_leaf_label(item: ChecklistItem) -> str:
+    leaf_raw = (item.requirement_text_leaf or "").strip()
+    leaf = _clean_hint_phrase(leaf_raw)
+    if not leaf:
+        return ""
+    raw_low = leaf_raw.strip().rstrip(".;:").lower()
+    if raw_low.startswith("its ") or raw_low.startswith("any "):
+        context = _atomic_context_label(item.requirement_text)
+        if context:
+            if raw_low.startswith("its "):
+                suffix = leaf_raw.strip().rstrip(".;:").lower()[4:].strip()
+                suffix_clean = _clean_hint_phrase(suffix)
+                if suffix_clean:
+                    return f"{suffix_clean} of {context}"
+            if raw_low.startswith("any "):
+                suffix = leaf_raw.strip().rstrip(".;:").lower()[4:].strip()
+                suffix_clean = _clean_hint_phrase(suffix)
+                if suffix_clean:
+                    return f"{suffix_clean} for {context}"
+    return leaf
+
+
+def _atomic_context_label(requirement_text: str) -> str:
+    req = (requirement_text or "").strip()
+    if not req:
+        return ""
+    m_adv = _DIRECTOR_ADVANCE_CONTEXT_RE.search(req)
+    if m_adv:
+        return "advances and credits to directors"
+    m_g = _DIRECTOR_GUARANTEE_CONTEXT_RE.search(req)
+    if m_g:
+        return "guarantees on behalf of directors"
+    cleaned = _clean_hint_phrase(req)
+    return cleaned
+
+
+def _fallback_keywords_for_item(item: ChecklistItem, max_keywords: int = 10) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    resolved_leaf = _resolved_atomic_leaf_label(item)
+    if item.clause_path and resolved_leaf:
+        normalized_resolved = resolved_leaf.strip().lower()
+        if normalized_resolved:
+            seen.add(normalized_resolved)
+            out.append(normalized_resolved)
+        preferred_texts = [resolved_leaf]
+    elif item.clause_path and item.requirement_text_leaf.strip():
+        preferred_texts = [item.requirement_text_leaf]
+    else:
+        preferred_texts = [item.requirement_text_leaf, item.requirement_text]
+    for text in preferred_texts:
+        phrase = _clean_hint_phrase(text)
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+        for m in _TOKEN.finditer(text or ""):
+            tok = m.group(0).lower()
+            if len(tok) < 3 or tok in _STOPWORDS or tok in _WEAK or tok.isdigit():
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= max_keywords:
+                return out
+    return out[:max_keywords]
+
+
+def _fallback_section_hints_for_item(item: ChecklistItem, max_hints: int = 4) -> list[str]:
+    text = " ".join(
+        x for x in [item.sheet_name, item.section_path, item.requirement_text, item.requirement_text_leaf] if x
+    ).lower()
+    hints: list[str] = []
+    if "statement of financial position" in text or "balance sheet" in text:
+        hints.append("balance sheet")
+    if "income statement" in text or "profit and loss" in text:
+        hints.append("income statement")
+    if "cash flow" in text:
+        hints.append("cash flow")
+    if "notes to the financial statements" in text or "notes" in text:
+        hints.append("notes")
+    if "accounting policy" in text or "accounting policies" in text:
+        hints.append("accounting policies")
+    if "director" in text:
+        hints.append("directors")
+    if "related party" in text:
+        hints.append("related party")
+    cleaned_section = _clean_hint_phrase(item.section_path)
+    if cleaned_section and cleaned_section not in hints and cleaned_section not in _GENERIC_HINTS:
+        hints.append(cleaned_section)
+    cleaned_sheet = _clean_hint_phrase(item.sheet_name)
+    if cleaned_sheet and cleaned_sheet not in hints and cleaned_sheet not in _GENERIC_HINTS:
+        hints.append(cleaned_sheet)
+    out: list[str] = []
+    seen: set[str] = set()
+    for hint in hints:
+        h = hint.strip().lower()
+        if not h or h in seen or h in _GENERIC_HINTS:
+            continue
+        seen.add(h)
+        out.append(h)
+        if len(out) >= max_hints:
+            break
+    return out
 
 
 def _keywords_from_rule_checks(rule_checks: list[dict[str, str]], max_keywords: int = 36) -> list[str]:
@@ -247,6 +471,14 @@ def _keywords_from_rule_checks(rule_checks: list[dict[str, str]], max_keywords: 
     seen: set[str] = set()
     for chk in rule_checks:
         label = str(chk.get("label") or "")
+        label_tokens = [m.group(0).lower() for m in _TOKEN.finditer(label)]
+        if label_tokens:
+            phrase = " ".join(tok for tok in label_tokens if tok not in _STOPWORDS and tok not in _WEAK)
+            if phrase and phrase not in seen and len(phrase.split()) <= 6:
+                seen.add(phrase)
+                out.append(phrase)
+                if len(out) >= max_keywords:
+                    return out
         for m in _TOKEN.finditer(label):
             tok = m.group(0).lower()
             if len(tok) < 3:
@@ -254,6 +486,8 @@ def _keywords_from_rule_checks(rule_checks: list[dict[str, str]], max_keywords: 
             if tok in _STOPWORDS or tok in _WEAK:
                 continue
             if tok.isdigit():
+                continue
+            if tok.endswith("ed") and tok[:-2] in _STOPWORDS:
                 continue
             if tok in seen:
                 continue

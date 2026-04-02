@@ -33,12 +33,15 @@ class EvidenceBlock(BaseModel):
 class CheckResult(BaseModel):
     checkId: str
     label: str
+    kind: str | None = None
     status: str
     reason: str | None = None
     confidence: float | None = Field(
         default=None,
         description="Model self-reported certainty for this atomic check (0–1).",
     )
+    selectedChunkIds: list[str] | None = None
+    evidenceSnippet: str | None = None
 
     @field_validator("confidence", mode="before")
     @classmethod

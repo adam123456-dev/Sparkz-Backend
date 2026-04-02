@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
-    evaluation_top_k: int = 3
+    evaluation_top_k: int = 4
+    evaluation_candidate_k: int = 12
     evaluation_evidence_max_chars: int = 900
     evaluation_requirement_max_chars: int = 1200
     evaluation_explanation_max_chars: int = 120
@@ -52,7 +53,7 @@ class Settings(BaseSettings):
             return "http://localhost:5173"
         return value
 
-    @field_validator("evaluation_top_k")
+    @field_validator("evaluation_top_k", "evaluation_candidate_k")
     @classmethod
     def validate_top_k(cls, value: int) -> int:
         return max(1, int(value))

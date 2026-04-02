@@ -13,9 +13,12 @@ import re
 from dataclasses import dataclass
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}\b")
 NATIONAL_ID_RE = re.compile(r"\b[A-Z]{2}\d{6}[A-Z]?\b", re.IGNORECASE)
 NAME_FIELD_RE = re.compile(r"\b(Name|Client|Prepared by|Reviewed by)\s*:\s*([A-Za-z][A-Za-z\s'.-]{1,80})")
+CONTACT_FIELD_RE = re.compile(
+    r"\b(Tel|Telephone|Phone|Mobile|Fax)\s*:\s*(\+?\d[\d\s().-]{6,}\d)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -48,7 +51,6 @@ def redact_pii_with_audit(text: str) -> tuple[str, list[PiiAuditEntry]]:
         return pattern.sub(_repl, source_text)
 
     output = _replace_regex(EMAIL_RE, "EMAIL", text)
-    output = _replace_regex(PHONE_RE, "PHONE", output)
     output = _replace_regex(NATIONAL_ID_RE, "ID", output)
 
     def _name_repl(match: re.Match[str]) -> str:
@@ -65,6 +67,21 @@ def redact_pii_with_audit(text: str) -> tuple[str, list[PiiAuditEntry]]:
         return f"{label}: {replacement}"
 
     output = NAME_FIELD_RE.sub(_name_repl, output)
+
+    def _contact_repl(match: re.Match[str]) -> str:
+        label = match.group(1)
+        original = match.group(2).strip()
+        replacement = _token("PHONE")
+        audits.append(
+            PiiAuditEntry(
+                entity_type="phone",
+                original_value=original,
+                replacement_value=replacement,
+            )
+        )
+        return f"{label}: {replacement}"
+
+    output = CONTACT_FIELD_RE.sub(_contact_repl, output)
     return output, audits
 
 

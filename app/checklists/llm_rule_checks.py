@@ -17,13 +17,14 @@ def generate_rule_checks_with_openai(
     model: str,
     requirement_text: str,
     requirement_text_leaf: str = "",
+    clause_path: str = "",
     max_checks: int = 4,
 ) -> list[dict[str, str]]:
     """
     Decompose one disclosure rule into atomic checks.
 
     Returns list items shaped as:
-    {"check_id": "c1", "label": "...", "kind": "required"}
+    {"check_id": "c1", "label": "...", "kind": "required"|"supporting"}
     """
     req = (requirement_text or "").strip()
     leaf = (requirement_text_leaf or "").strip()
@@ -34,17 +35,22 @@ def generate_rule_checks_with_openai(
         "You decompose accounting disclosure rules into atomic checks.\n"
         "Return JSON only with key: checks.\n"
         "checks is an array of objects with keys: check_id, label, kind.\n"
-        "kind must be 'required' only.\n"
+        "kind must be 'required' or 'supporting'.\n"
         "Rules:\n"
         "- Each check must be independently verifiable from document evidence.\n"
         "- Keep checks short, concrete, and non-overlapping.\n"
         "- Start each check label with a concrete subject, not verbs like verify/check/ensure.\n"
         "- Avoid meta checks (e.g., correct year, qualifies in general) unless explicit in rule text.\n"
         "- Do not include legal citations or references.\n"
+        "- If Requirement (leaf) is a narrow subclause, preserve that exact scope.\n"
+        "- Do not reintroduce sibling clauses or broader parent obligations that are absent from the leaf.\n"
+        "- Mark a check as 'required' when failure should block the row from being fully met.\n"
+        "- Mark a check as 'supporting' only when it adds detail/context but should not override a clearly satisfied core disclosure.\n"
     )
     user = (
         f"Requirement (full): {req}\n"
         f"Requirement (leaf): {leaf}\n\n"
+        f"Clause path: {clause_path}\n\n"
         f"Return up to {max_checks} checks."
     )
     payload = {
@@ -97,7 +103,10 @@ def _normalize_rule_checks(raw: object, max_checks: int) -> list[dict[str, str]]
             continue
         seen_labels.add(low)
         check_id = str(item.get("check_id") or f"c{idx}").strip() or f"c{idx}"
-        out.append({"check_id": check_id, "label": label, "kind": "required"})
+        kind = str(item.get("kind") or "required").strip().lower()
+        if kind not in {"required", "supporting"}:
+            kind = "required"
+        out.append({"check_id": check_id, "label": label, "kind": kind})
         if len(out) >= max_checks:
             break
     return out
@@ -120,6 +129,9 @@ def _filter_low_signal_checks(checks: list[dict[str, str]]) -> list[dict[str, st
         if low in seen:
             continue
         seen.add(low)
-        out.append({"check_id": chk["check_id"], "label": label, "kind": "required"})
+        kind = str(chk.get("kind") or "required").strip().lower()
+        if kind not in {"required", "supporting"}:
+            kind = "required"
+        out.append({"check_id": chk["check_id"], "label": label, "kind": kind})
     return out
 

@@ -7,6 +7,7 @@ from typing import Any
 from app.core.config import get_settings
 from app.db.supabase import get_supabase_client
 from app.db.supabase_retry import execute_with_retry
+from app.evaluation.check_evidence import select_chunks_for_check, select_evidence_for_check
 from app.evaluation.llm_judge import judge_disclosure
 from app.evaluation.requirements import requirement_text_by_item_key
 from app.evaluation.evidence_payload import build_evidence_blocks
@@ -172,6 +173,10 @@ def _insert_chunks(analysis_id: str, chunks: list[RedactedChunk]) -> None:
             "text_redacted": chunk.text_redacted,
             "text_hash": chunk.text_hash,
             "heading_guess": chunk.heading_guess or "",
+            "section_title": chunk.section_title or "",
+            "statement_area": chunk.statement_area or "",
+            "chunk_type": chunk.chunk_type or "",
+            "note_number": chunk.note_number or "",
         }
         for chunk in chunks
     ]
@@ -274,6 +279,7 @@ def _uniform_reason(check_results: list[dict[str, Any]]) -> str | None:
 def _row_explanation(
     *,
     has_lexical_candidates: bool,
+    lexical_miss: bool,
     check_results: list[dict[str, Any]],
     max_chars: int,
 ) -> str | None:
@@ -282,6 +288,10 @@ def _row_explanation(
     uniform = _uniform_reason(check_results)
     if uniform:
         return uniform
+    if lexical_miss:
+        compact = _synthesize_row_explanation(check_results, max_chars=max_chars)
+        if compact:
+            return f"Keyword shortlist missed; fallback retrieval used. {compact}"
     return _synthesize_row_explanation(check_results, max_chars=max_chars)
 
 
@@ -336,6 +346,7 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
         analysis_id,
         checklist_type_key,
         top_k=settings.evaluation_top_k,
+        candidate_k=settings.evaluation_candidate_k,
         keyword_prefilter=settings.evaluation_keyword_prefilter,
     )
     if not item_keys:
@@ -350,6 +361,7 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
     results_payload = []
     for item_key, tops, kw_miss in zip(item_keys, tops_per_item, lexical_miss):
         merged, best_sim = _merge_evidence_texts(tops, settings.evaluation_evidence_max_chars)
+        has_retrieved_evidence = bool(merged.strip())
         evidence_json = build_evidence_blocks(tops)
         requirement = req_by_key.get(item_key, "")[: settings.evaluation_requirement_max_chars]
         evidence_for_model = merged if merged.strip() else _NO_RETRIEVED_TEXT
@@ -358,14 +370,16 @@ def _evaluate_checklist(analysis_id: str, checklist_type_key: str) -> None:
             checks=checks,
             requirement_text=requirement,
             evidence_text=evidence_for_model,
-            has_lexical_candidates=not kw_miss,
+            evidence_chunks=tops,
+            has_lexical_candidates=has_retrieved_evidence,
             openai_api_key=settings.openai_api_key,
             openai_chat_model=settings.openai_chat_model,
             explanation_max_chars=settings.evaluation_explanation_max_chars,
         )
         status, coverage = _aggregate_rule_status(check_results)
         explanation = _row_explanation(
-            has_lexical_candidates=not kw_miss,
+            has_lexical_candidates=has_retrieved_evidence,
+            lexical_miss=kw_miss,
             check_results=check_results,
             max_chars=settings.evaluation_row_explanation_max_chars,
         )
@@ -452,7 +466,10 @@ def _normalize_rule_checks(raw: list[dict[str, str]] | None, *, fallback_require
         if not label:
             continue
         cid = str(entry.get("check_id") or f"c{idx}").strip() or f"c{idx}"
-        out.append({"check_id": cid, "label": label, "kind": "required"})
+        kind = str(entry.get("kind") or "required").strip().lower()
+        if kind not in {"required", "supporting"}:
+            kind = "required"
+        out.append({"check_id": cid, "label": label, "kind": kind})
     if not out:
         label = (fallback_requirement or "").strip() or "Disclosure requirement"
         return [{"check_id": "c1", "label": label, "kind": "required"}]
@@ -464,6 +481,7 @@ def _evaluate_checks_for_rule(
     checks: list[dict[str, str]],
     requirement_text: str,
     evidence_text: str,
+    evidence_chunks: list[TopChunk],
     has_lexical_candidates: bool,
     openai_api_key: str,
     openai_chat_model: str,
@@ -475,9 +493,12 @@ def _evaluate_checks_for_rule(
             {
                 "checkId": c["check_id"],
                 "label": c["label"],
+                "kind": c.get("kind", "required"),
                 "status": "missing",
                 "reason": _NO_KEYWORD_MSG,
                 "confidence": None,
+                "selectedChunkIds": [],
+                "evidenceSnippet": None,
             }
             for c in checks
         ]
@@ -486,9 +507,12 @@ def _evaluate_checks_for_rule(
             {
                 "checkId": c["check_id"],
                 "label": c["label"],
+                "kind": c.get("kind", "required"),
                 "status": "missing",
                 "reason": _NO_USABLE_TEXT_MSG,
                 "confidence": None,
+                "selectedChunkIds": [],
+                "evidenceSnippet": None,
             }
             for c in checks
         ]
@@ -496,13 +520,32 @@ def _evaluate_checks_for_rule(
     out: list[dict[str, Any]] = []
     for c in checks:
         check_label = c["label"]
-        check_prompt = f"{requirement_text}\n\nAtomic check: {check_label}"
+        row_context = _truncate_text(requirement_text, 220) or requirement_text
+        check_prompt = (
+            f"Row context: {row_context}\n"
+            f"Atomic check: {check_label}\n"
+            "Judge only this atomic check against the evidence."
+        )
+        selected_chunks = select_chunks_for_check(
+            check_label=check_label,
+            chunks=evidence_chunks,
+            max_chunks=2,
+        )
+        check_evidence = select_evidence_for_check(
+            check_label=check_label,
+            chunks=selected_chunks or evidence_chunks,
+            max_chunks=2,
+            max_chars=max(280, min(700, len(evidence_text) or 700)),
+        )
+        evidence_for_check = check_evidence or evidence_text
+        selected_chunk_ids = [chunk.chunk_id for chunk in selected_chunks if chunk.chunk_id]
+        evidence_snippet = _truncate_text(evidence_for_check, 180) if evidence_for_check.strip() else None
         try:
             raw = judge_disclosure(
                 api_key=openai_api_key,
                 model=openai_chat_model,
                 requirement_text=check_prompt,
-                evidence_text=evidence_text,
+                evidence_text=evidence_for_check,
             )
             verdict = parse_judge_response(raw, explanation_max_chars=explanation_max_chars)
             if verdict.status:
@@ -524,9 +567,12 @@ def _evaluate_checks_for_rule(
             {
                 "checkId": c["check_id"],
                 "label": check_label,
+                "kind": c.get("kind", "required"),
                 "status": status,
                 "reason": reason,
                 "confidence": confidence,
+                "selectedChunkIds": selected_chunk_ids,
+                "evidenceSnippet": evidence_snippet,
             }
         )
     return out
@@ -535,13 +581,23 @@ def _evaluate_checks_for_rule(
 def _aggregate_rule_status(check_results: list[dict[str, Any]]) -> tuple[str, float]:
     if not check_results:
         return "missing", 0.0
-    total = len(check_results)
-    full = sum(1 for r in check_results if r.get("status") == "fully_met")
-    partial = sum(1 for r in check_results if r.get("status") == "partially_met")
-    coverage = (full + 0.5 * partial) / total
-    if full == total:
+    weighted_total = 0.0
+    weighted_score = 0.0
+    required_results = [r for r in check_results if r.get("kind") != "supporting"]
+    if not required_results:
+        required_results = check_results
+    for result in check_results:
+        weight = 0.35 if result.get("kind") == "supporting" else 1.0
+        weighted_total += weight
+        if result.get("status") == "fully_met":
+            weighted_score += weight
+        elif result.get("status") == "partially_met":
+            weighted_score += 0.5 * weight
+    coverage = weighted_score / max(weighted_total, 1e-9)
+    required_statuses = [str(r.get("status") or "") for r in required_results]
+    if required_statuses and all(status == "fully_met" for status in required_statuses):
         return "fully_met", coverage
-    if full == 0 and partial == 0:
+    if required_statuses and all(status == "missing" for status in required_statuses):
         return "missing", coverage
     return "partially_met", coverage
 

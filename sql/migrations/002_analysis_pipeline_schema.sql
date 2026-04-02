@@ -33,6 +33,10 @@ create table if not exists public.analysis_chunks (
   text_redacted text not null,
   text_hash text not null,
   heading_guess text not null default '',
+  section_title text not null default '',
+  statement_area text not null default '',
+  chunk_type text not null default '',
+  note_number text not null default '',
   search_tsv tsvector generated always as (to_tsvector('english', coalesce(text_redacted, ''))) stored,
   created_at timestamptz not null default now(),
   unique (analysis_id, chunk_index)
@@ -79,6 +83,17 @@ alter table if exists public.analysis_results
   add column if not exists check_results jsonb not null default '[]'::jsonb;
 alter table if exists public.analysis_results
   add column if not exists coverage float not null default 0;
+alter table if exists public.analysis_chunks
+  add column if not exists section_title text not null default '';
+alter table if exists public.analysis_chunks
+  add column if not exists statement_area text not null default '';
+alter table if exists public.analysis_chunks
+  add column if not exists chunk_type text not null default '';
+alter table if exists public.analysis_chunks
+  add column if not exists note_number text not null default '';
+
+drop function if exists public.match_analysis_chunks(vector(1536), uuid, int);
+drop function if exists public.match_analysis_chunks(vector, uuid, integer);
 
 create or replace function public.match_analysis_chunks (
   query_embedding vector(1536),
@@ -89,7 +104,12 @@ returns table (
   chunk_id uuid,
   page_number int,
   text_redacted text,
-  similarity float
+  similarity float,
+  heading_guess text,
+  section_title text,
+  statement_area text,
+  chunk_type text,
+  note_number text
 )
 language sql
 as $$
@@ -97,7 +117,12 @@ as $$
     ac.id as chunk_id,
     ac.page_number,
     ac.text_redacted,
-    1 - (ace.embedding <=> query_embedding) as similarity
+    1 - (ace.embedding <=> query_embedding) as similarity,
+    ac.heading_guess,
+    ac.section_title,
+    ac.statement_area,
+    ac.chunk_type,
+    ac.note_number
   from public.analysis_chunk_embeddings ace
   join public.analysis_chunks ac on ac.id = ace.chunk_id
   where ace.analysis_id = filter_analysis_id

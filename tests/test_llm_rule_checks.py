@@ -9,7 +9,7 @@ class LlmRuleChecksTests(unittest.TestCase):
             [
                 {"check_id": "a", "label": "State registered office", "kind": "required"},
                 {"check_id": "b", "label": "State registered office", "kind": "required"},
-                {"label": "State company number"},
+                {"label": "State company number", "kind": "supporting"},
             ],
             max_checks=5,
         )
@@ -17,6 +17,7 @@ class LlmRuleChecksTests(unittest.TestCase):
         self.assertEqual(checks[0]["check_id"], "a")
         self.assertEqual(checks[0]["kind"], "required")
         self.assertEqual(checks[1]["check_id"], "c3")
+        self.assertEqual(checks[1]["kind"], "supporting")
 
     def test_filters_generic_checks(self) -> None:
         checks = _filter_low_signal_checks(
